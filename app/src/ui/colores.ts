@@ -1,0 +1,17 @@
+export const colores = {
+  fondo: '#f7f9fa',
+  texto: '#1c2a2e',
+  textoSecundario: '#647178',
+  etiqueta: '#3a474c',
+  borde: '#dde3e5',
+  acento: '#3D7CB8',
+  acentoSuave: '#dce9f4',
+  error: '#b42318',
+  blanco: '#ffffff',
+  gradienteInicio: '#A9D3E5',
+  gradienteFin: '#4A8FC2',
+  textoOscuro: '#1c3a4a',
+  estadoOk: '#4CAF50',
+  estadoAlerta: '#E5484D',
+  acentoFormulario: '#8DA750',
+};
