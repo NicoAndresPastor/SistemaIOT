@@ -3,6 +3,7 @@ import { authRouter } from './auth/routes';
 import { requireAuth } from './auth/middleware';
 import { acuariosRouter } from './acuarios/routes';
 import { iniciarSuscriptorMqtt } from './mqtt/subscriber';
+import { inicializarClienteCalibracion } from './mqtt/calibracion';
 
 const app = express();
 const PORT = 3000;
@@ -29,4 +30,5 @@ app.listen(PORT, () => {
   console.log(`Servidor escuchando en http://localhost:${PORT}`);
 });
 
-iniciarSuscriptorMqtt();
+const clienteMqtt = iniciarSuscriptorMqtt();
+inicializarClienteCalibracion(clienteMqtt);

@@ -1,7 +1,44 @@
 import { Router } from 'express';
 import { pool } from '../db';
+import { pedirCalibracion } from '../mqtt/calibracion';
 
 export const acuariosRouter = Router();
+
+// Usado por las tres rutas de calibracion: confirma que el acuario es del
+// usuario y que tiene un dispositivo vinculado, y devuelve tanto su id como
+// su identificador_hardware (uno para persistir en la base, el otro para
+// armar el topico MQTT).
+type DispositivoVinculado =
+  | { error: 404; mensaje: string }
+  | { dispositivoId: string; identificadorHardware: string };
+
+async function resolverDispositivoVinculado(
+  acuarioId: string,
+  usuarioId: string
+): Promise<DispositivoVinculado> {
+  const acuario = await pool.query('SELECT id FROM acuario WHERE id = $1 AND usuario_id = $2', [
+    acuarioId,
+    usuarioId,
+  ]);
+  if (acuario.rows.length === 0) {
+    return { error: 404 as const, mensaje: 'Acuario no encontrado' };
+  }
+
+  const resultado = await pool.query(
+    `SELECT d.id AS dispositivo_id, d.identificador_hardware
+     FROM vinculacion v JOIN dispositivo d ON d.id = v.dispositivo_id
+     WHERE v.acuario_id = $1 AND v.fecha_fin IS NULL`,
+    [acuarioId]
+  );
+  if (resultado.rows.length === 0) {
+    return { error: 404 as const, mensaje: 'Este acuario no tiene un dispositivo vinculado' };
+  }
+
+  return {
+    dispositivoId: resultado.rows[0].dispositivo_id as string,
+    identificadorHardware: resultado.rows[0].identificador_hardware as string,
+  };
+}
 
 acuariosRouter.post('/', async (req, res) => {
   const { nombre, volumenLitros, tipoAgua } = req.body;
@@ -226,4 +263,153 @@ acuariosRouter.delete('/:id/dispositivo', async (req, res) => {
     return;
   }
   res.status(204).send();
+});
+
+// POST /acuarios/:id/calibracion/leer  (CU-12: pide una lectura cruda en vivo)
+acuariosRouter.post('/:id/calibracion/leer', async (req, res) => {
+  const { parametro } = req.body;
+  if (typeof parametro !== 'string') {
+    res.status(400).json({ error: 'Falta el parametro a leer' });
+    return;
+  }
+
+  const resuelto = await resolverDispositivoVinculado(req.params.id, req.usuarioId!);
+  if ('error' in resuelto) {
+    res.status(resuelto.error).json({ error: resuelto.mensaje });
+    return;
+  }
+
+  const parametroFila = await pool.query('SELECT id FROM parametro WHERE codigo = $1', [parametro]);
+  if (parametroFila.rows.length === 0) {
+    res.status(400).json({ error: 'Parametro desconocido' });
+    return;
+  }
+
+  try {
+    const respuesta = await pedirCalibracion(resuelto.identificadorHardware, { accion: 'leer', parametro });
+    if (!respuesta.ok) {
+      res.status(502).json({ error: respuesta.error ?? 'El dispositivo no pudo completar la lectura' });
+      return;
+    }
+    res.json({ lectura: respuesta.lectura });
+  } catch (err) {
+    res.status(504).json({ error: err instanceof Error ? err.message : 'No se pudo contactar al dispositivo' });
+  }
+});
+
+// POST /acuarios/:id/calibracion/punto  (CU-12: fija un punto de calibracion en la placa)
+acuariosRouter.post('/:id/calibracion/punto', async (req, res) => {
+  const { parametro, punto, valorReferencia } = req.body;
+  if (typeof parametro !== 'string') {
+    res.status(400).json({ error: 'Falta el parametro' });
+    return;
+  }
+  if (!Number.isInteger(punto) || punto < 1 || punto > 3) {
+    res.status(400).json({ error: 'El punto debe ser 1, 2 o 3' });
+    return;
+  }
+  if (typeof valorReferencia !== 'number') {
+    res.status(400).json({ error: 'Falta el valor de referencia de la solucion patron' });
+    return;
+  }
+
+  const resuelto = await resolverDispositivoVinculado(req.params.id, req.usuarioId!);
+  if ('error' in resuelto) {
+    res.status(resuelto.error).json({ error: resuelto.mensaje });
+    return;
+  }
+
+  const parametroFila = await pool.query('SELECT id FROM parametro WHERE codigo = $1', [parametro]);
+  if (parametroFila.rows.length === 0) {
+    res.status(400).json({ error: 'Parametro desconocido' });
+    return;
+  }
+
+  try {
+    const respuesta = await pedirCalibracion(resuelto.identificadorHardware, {
+      accion: 'fijarPunto',
+      parametro,
+      punto,
+      valorReferencia,
+    });
+    if (!respuesta.ok) {
+      res.status(502).json({ error: respuesta.error ?? 'El dispositivo no pudo fijar el punto' });
+      return;
+    }
+    res.json({ lecturaAntes: respuesta.lecturaAntes, lecturaDespues: respuesta.lecturaDespues });
+  } catch (err) {
+    res.status(504).json({ error: err instanceof Error ? err.message : 'No se pudo contactar al dispositivo' });
+  }
+});
+
+// POST /acuarios/:id/calibracion  (CU-12: registra la calibracion ya terminada)
+//
+// La app llama a este endpoint recien cuando el usuario completo todos los
+// puntos que necesitaba el sensor -- "leer" y "punto" de arriba no tocan la
+// base, solo dialogan con la placa en vivo.
+acuariosRouter.post('/:id/calibracion', async (req, res) => {
+  const { parametro, puntos } = req.body;
+  if (typeof parametro !== 'string') {
+    res.status(400).json({ error: 'Falta el parametro' });
+    return;
+  }
+  if (!Array.isArray(puntos) || puntos.length === 0) {
+    res.status(400).json({ error: 'Faltan los puntos de calibracion' });
+    return;
+  }
+  for (const punto of puntos) {
+    if (
+      typeof punto?.valorReferencia !== 'number' ||
+      typeof punto?.lecturaAntes !== 'number' ||
+      typeof punto?.lecturaDespues !== 'number'
+    ) {
+      res.status(400).json({ error: 'Cada punto debe tener valorReferencia, lecturaAntes y lecturaDespues numericos' });
+      return;
+    }
+  }
+
+  const resuelto = await resolverDispositivoVinculado(req.params.id, req.usuarioId!);
+  if ('error' in resuelto) {
+    res.status(resuelto.error).json({ error: resuelto.mensaje });
+    return;
+  }
+
+  const parametroFila = await pool.query('SELECT id FROM parametro WHERE codigo = $1', [parametro]);
+  if (parametroFila.rows.length === 0) {
+    res.status(400).json({ error: 'Parametro desconocido' });
+    return;
+  }
+  const parametroId = parametroFila.rows[0].id;
+
+  const client = await pool.connect();
+  try {
+    await client.query('BEGIN');
+
+    const calibracionResultado = await client.query(
+      `INSERT INTO calibracion (dispositivo_id, parametro_id) VALUES ($1, $2)
+       RETURNING id, fecha_hora`,
+      [resuelto.dispositivoId, parametroId]
+    );
+    const calibracionId = calibracionResultado.rows[0].id;
+
+    for (const punto of puntos) {
+      await client.query(
+        `INSERT INTO punto_calibracion (calibracion_id, valor_referencia, lectura_antes, lectura_despues)
+         VALUES ($1, $2, $3, $4)`,
+        [calibracionId, punto.valorReferencia, punto.lecturaAntes, punto.lecturaDespues]
+      );
+    }
+
+    await client.query('COMMIT');
+    res.status(201).json({
+      id: calibracionId,
+      fechaHora: calibracionResultado.rows[0].fecha_hora,
+      puntos: puntos.length,
+    });
+  } catch (error) {
+    await client.query('ROLLBACK');
+    throw error;
+  } finally {
+    client.release();
+  }
 });

@@ -1,12 +1,18 @@
 import mqtt from 'mqtt';
 import { pool } from '../db';
+import { manejarRespuestaCalibracion } from './calibracion';
 
 const BROKER_URL = process.env.MQTT_BROKER_URL ?? 'mqtt://localhost:1883';
 const TOPIC_MEDICIONES = 'acuarios/+/mediciones';
+const TOPIC_CALIBRACION_RESPUESTA = 'acuarios/+/calibracion/respuesta';
 
 interface LecturaRecibida {
   parametro: string;
   valor: number;
+  // Opcional: si falta, se usa mensaje.marcaTemporal (compatibilidad con
+  // el envio en vivo, donde las 3 lecturas del ciclo comparten un mismo
+  // instante). Al reenviar el buffer offline, cada lectura trae la suya.
+  marcaTemporal?: string;
 }
 
 interface MensajeMediciones {
@@ -20,9 +26,14 @@ export function iniciarSuscriptorMqtt() {
   client.on('connect', () => {
     console.log('MQTT: conectado al broker', BROKER_URL);
     client.subscribe(TOPIC_MEDICIONES);
+    client.subscribe(TOPIC_CALIBRACION_RESPUESTA);
   });
 
   client.on('message', (topic, payload) => {
+    if (topic.endsWith('/calibracion/respuesta')) {
+      manejarRespuestaCalibracion(payload);
+      return;
+    }
     procesarMensaje(topic, payload).catch((error) => {
       console.error('MQTT: error procesando mensaje de', topic, error);
     });
@@ -81,13 +92,21 @@ async function procesarMensaje(topic: string, payload: Buffer) {
       continue;
     }
     const parametroId = parametroResultado.rows[0].id;
+    const marcaTemporal = lectura.marcaTemporal ?? mensaje.marcaTemporal;
 
-    await pool.query(
-      `INSERT INTO medicion (acuario_id, parametro_id, dispositivo_id, valor, marca_temporal, origen)
-       VALUES ($1, $2, $3, $4, $5, 'AUTOMATICA')
-       ON CONFLICT DO NOTHING`,
-      [acuarioId, parametroId, dispositivoId, lectura.valor, mensaje.marcaTemporal]
-    );
+    try {
+      await pool.query(
+        `INSERT INTO medicion (acuario_id, parametro_id, dispositivo_id, valor, marca_temporal, origen)
+         VALUES ($1, $2, $3, $4, $5, 'AUTOMATICA')
+         ON CONFLICT DO NOTHING`,
+        [acuarioId, parametroId, dispositivoId, lectura.valor, marcaTemporal]
+      );
+    } catch (error) {
+      // Una lectura invalida (ej. marcaTemporal con formato incorrecto) no
+      // debe tirar abajo el resto del lote -- importante cuando se reenvia
+      // un buffer de varias lecturas acumuladas offline.
+      console.warn(`MQTT: no se pudo guardar la lectura de "${lectura.parametro}"`, error);
+    }
   }
 
   await pool.query('UPDATE dispositivo SET ultima_comunicacion = now() WHERE id = $1', [dispositivoId]);

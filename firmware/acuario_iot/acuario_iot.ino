@@ -2,11 +2,17 @@
 #include <WebServer.h>
 #include <DNSServer.h>
 #include <Preferences.h>
+#define MQTT_MAX_PACKET_SIZE 384
 #include <PubSubClient.h>
 #include <ArduinoJson.h>
 #include <OneWire.h>
 #include <DallasTemperature.h>
 #include <time.h>
+#include <sys/time.h>
+#include <Wire.h>
+#include <U8g2lib.h>
+#include <RTClib.h>
+#include <LittleFS.h>
 #include "config.h"
 
 const int MQTT_PORT = 1883;
@@ -20,8 +26,21 @@ const unsigned long BOTON_RESET_MANTENER_MS = 5000;
 
 const int PIN_DS = 4;
 const int PIN_TDS_PWR = 19;
-const int PIN_TDS = 34;
-const int PIN_PH = 35;
+const int PIN_TDS = 35;
+const int PIN_PH = 32;
+
+const int PIN_SDA = 21;
+const int PIN_SCL = 22;
+const uint8_t DIRECCION_DISPLAY = 0x3C;
+
+const bool SIMULAR_SENSORES = false;
+
+const unsigned long TIMEOUT_NTP_MS = 15000;
+const unsigned long INTERVALO_REINTENTO_MQTT_INICIAL_MS = 1000;
+const unsigned long INTERVALO_REINTENTO_MQTT_MAX_MS = 5UL * 60 * 1000;
+
+const uint32_t CAPACIDAD_REGISTROS_PENDIENTES = 10000;
+const char* ARCHIVO_PENDIENTES = "/pendientes.dat";
 
 const float K_DIVISOR = 1800.0f / 2800.0f;
 const uint32_t MS_ASENTAR_PH = 800;
@@ -31,10 +50,28 @@ const float PH_V_POR_UNIDAD = 0.175f;
 
 Preferences preferencias;
 Preferences memoriaCal;
+Preferences memoriaBuffer;
 WebServer servidorConfig(80);
 DNSServer dnsServer;
 WiFiClient wifiClient;
 PubSubClient mqttClient(wifiClient);
+U8G2_SSD1306_128X64_NONAME_F_HW_I2C display(U8G2_R0, U8X8_PIN_NONE);
+bool hayDisplay = false;
+RTC_DS3231 rtc;
+bool hayRtc = false;
+
+unsigned long ultimoIntentoMqtt = 0;
+unsigned long intervaloReintentoMqtt = INTERVALO_REINTENTO_MQTT_INICIAL_MS;
+
+struct __attribute__((packed)) RegistroPendiente {
+  uint32_t marcaTemporal;
+  uint8_t parametro;
+  float valor;
+};
+
+uint32_t bufferCabeza = 0;
+uint32_t bufferCola = 0;
+uint32_t bufferCantidad = 0;
 
 OneWire oneWire(PIN_DS);
 DallasTemperature ds(&oneWire);
@@ -54,9 +91,13 @@ bool tempValida = false;
 bool phValida = false;
 bool condValida = false;
 
-float calV1 = 0, calPh1 = 0, calV2 = 0, calPh2 = 0;
-bool cal1 = false, cal2 = false;
-float calTc = 25.0f;
+struct Calibracion {
+  float x[3] = { 0, 0, 0 };
+  float y[3] = { 0, 0, 0 };
+  uint8_t n = 0;
+};
+Calibracion calTemp, calPh, calCond;
+
 float ultimaTempOk = NAN;
 float ultimoPo = 0;
 
@@ -88,6 +129,10 @@ void setup() {
   pinMode(PIN_BOTON_RESET, INPUT_PULLUP);
   preferencias.begin("wifi", false);
   iniciarSensores();
+  Wire.begin(PIN_SDA, PIN_SCL);
+  iniciarRtc();
+  iniciarDisplay();
+  iniciarBufferPendientes();
 
   String ssidGuardado = preferencias.getString("ssid", "");
   if (ssidGuardado == "") {
@@ -108,17 +153,21 @@ void loop() {
   }
 
   if (!mqttClient.connected()) {
-    conectarMqtt();
+    intentarConectarMqtt();
   }
   mqttClient.loop();
+
+  if (mqttClient.connected() && bufferCantidad > 0) {
+    reenviarPendientes(5);
+  }
 
   if (millis() - ultimoMuestreo >= INTERVALO_MUESTREO_MS) {
     ultimoMuestreo = millis();
     leerSensores();
-    publicarLecturas();
+    publicarOGuardarLecturas();
+    mostrarEnDisplay();
   }
 }
-
 
 void revisarBotonReset() {
   bool presionadoAhora = (digitalRead(PIN_BOTON_RESET) == LOW);
@@ -142,7 +191,6 @@ void revisarBotonReset() {
   }
 }
 
-
 void iniciarModoConfiguracion() {
   enModoConfiguracion = true;
   Serial.println("Sin WiFi guardado. Iniciando modo configuracion...");
@@ -160,6 +208,8 @@ void iniciarModoConfiguracion() {
   servidorConfig.on("/guardar", HTTP_POST, guardarCredenciales);
   servidorConfig.onNotFound(mostrarFormulario);
   servidorConfig.begin();
+
+  mostrarMensajeEnDisplay("Configurar WiFi", "Conectate a la red", AP_SSID);
 }
 
 String paginaBase(String estilosExtra, String cuerpoExtra) {
@@ -296,13 +346,13 @@ void guardarCredenciales() {
   ESP.restart();
 }
 
-
 void conectarWifiGuardado() {
   String ssid = preferencias.getString("ssid", "");
   String password = preferencias.getString("password", "");
 
   Serial.print("Conectando a WiFi guardado: ");
   Serial.println(ssid);
+  mostrarMensajeEnDisplay("Conectando a WiFi", ssid.c_str(), "");
 
   WiFi.mode(WIFI_STA);
   WiFi.begin(ssid.c_str(), password.c_str());
@@ -324,35 +374,56 @@ void conectarWifiGuardado() {
   Serial.print("Conectado. IP asignada a la placa: ");
   Serial.println(WiFi.localIP());
 
-  sincronizarHoraNTP();
+  sincronizarHora();
   mqttClient.setServer(MQTT_BROKER, MQTT_PORT);
+  mqttClient.setCallback(manejarMensajeMqtt);
 }
 
-void sincronizarHoraNTP() {
+void sincronizarHora() {
   configTime(0, 0, "pool.ntp.org", "time.nist.gov");
   Serial.print("Sincronizando hora por NTP");
+  unsigned long inicio = millis();
   time_t ahora = time(nullptr);
   while (ahora < 1700000000) {
+    if (millis() - inicio > TIMEOUT_NTP_MS) {
+      Serial.println();
+      if (hayRtc) {
+        struct timeval tv = { (time_t)rtc.now().unixtime(), 0 };
+        settimeofday(&tv, nullptr);
+        Serial.println("Sin NTP: se tomo la hora del modulo RTC");
+      } else {
+        Serial.println("Sin NTP y sin RTC: las mediciones quedaran sin hora valida");
+      }
+      return;
+    }
     delay(500);
     Serial.print(".");
     ahora = time(nullptr);
   }
   Serial.println();
-  Serial.println("Hora sincronizada correctamente");
+  Serial.println("Hora sincronizada correctamente por NTP");
+  if (hayRtc) rtc.adjust(DateTime((uint32_t)ahora));
 }
 
-void conectarMqtt() {
-  while (!mqttClient.connected()) {
-    Serial.print("Conectando a MQTT...");
-    String clientId = "ESP32-" + String(IDENTIFICADOR_HARDWARE);
-    if (mqttClient.connect(clientId.c_str())) {
-      Serial.println(" conectado");
-    } else {
-      Serial.print(" fallo, codigo=");
-      Serial.print(mqttClient.state());
-      Serial.println(" -- reintentando en 5s");
-      delay(5000);
+void intentarConectarMqtt() {
+  if (millis() - ultimoIntentoMqtt < intervaloReintentoMqtt) return;
+  ultimoIntentoMqtt = millis();
+
+  Serial.print("Conectando a MQTT...");
+  String clientId = "ESP32-" + String(IDENTIFICADOR_HARDWARE);
+  if (mqttClient.connect(clientId.c_str())) {
+    Serial.println(" conectado");
+    String topicComando = "acuarios/" + String(IDENTIFICADOR_HARDWARE) + "/calibracion/comando";
+    mqttClient.subscribe(topicComando.c_str());
+    intervaloReintentoMqtt = INTERVALO_REINTENTO_MQTT_INICIAL_MS;
+    if (bufferCantidad > 0) {
+      Serial.printf("Conexion restablecida: enviando %u lecturas pendientes\n", bufferCantidad);
     }
+  } else {
+    Serial.print(" fallo, codigo=");
+    Serial.print(mqttClient.state());
+    intervaloReintentoMqtt = min(intervaloReintentoMqtt * 2, INTERVALO_REINTENTO_MQTT_MAX_MS);
+    Serial.printf(" -- reintentando en %lus\n", intervaloReintentoMqtt / 1000);
   }
 }
 
@@ -377,51 +448,186 @@ float usPorCmDesde(float mv, float tempC) {
   return 133.42f * vc * vc * vc - 255.86f * vc * vc + 857.39f * vc;
 }
 
-float phDesdePo(float po, float tempC) {
-  float tK = (isnan(tempC) ? calTc : tempC) + 273.15f;
-  if (cal1 && cal2 && fabsf(calV1 - calV2) > 0.05f) {
-    float m = (calPh1 - calPh2) / (calV1 - calV2);
-    float v7 = calV1 + (7.0f - calPh1) / m;
-    float mT = m * (calTc + 273.15f) / tK;
-    return 7.0f + mT * (po - v7);
-  }
+float phNominal(float po, float tempC) {
+  float tK = (isnan(tempC) ? 25.0f : tempC) + 273.15f;
   float sT = PH_V_POR_UNIDAD * tK / 298.15f;
-  if (cal1) return calPh1 + (calV1 - po) / sT;
   return 7.0f + (PH_V_NEUTRO - po) / sT;
 }
 
-const char* estadoCal() {
-  static char buf[56];
-  if (cal1 && cal2) {
-    snprintf(buf, sizeof buf, "calibrado con 2 puntos (a %.1f C)", calTc);
-    return buf;
+float valorSimulado(const String &parametro) {
+  float minutos = millis() / 60000.0f;
+  if (parametro == "TEMP") return 25.0f + 1.5f * sinf(minutos * 0.5f);
+  if (parametro == "PH") return 7.0f + 0.3f * sinf(minutos * 0.3f + 1.0f);
+  return 450.0f + 60.0f * sinf(minutos * 0.4f + 2.0f);
+}
+
+bool parametroValido(const String &parametro) {
+  return parametro == "TEMP" || parametro == "PH" || parametro == "COND";
+}
+
+Calibracion& calDe(const String &parametro) {
+  if (parametro == "TEMP") return calTemp;
+  if (parametro == "COND") return calCond;
+  return calPh;
+}
+
+float aplicarCorreccion(const Calibracion &c, float crudo) {
+  if (c.n == 0) return crudo;
+  if (c.n == 1) return crudo + (c.y[0] - c.x[0]);
+  float sx = 0, sy = 0, sxy = 0, sxx = 0;
+  for (uint8_t i = 0; i < c.n; i++) {
+    sx += c.x[i];
+    sy += c.y[i];
+    sxy += c.x[i] * c.y[i];
+    sxx += c.x[i] * c.x[i];
   }
-  if (cal1) return "calibrado con 1 punto (pendiente nominal)";
-  return "SIN CALIBRAR (recta de fabrica: el valor es orientativo)";
+  float nF = c.n;
+  float denom = nF * sxx - sx * sx;
+  if (fabsf(denom) < 1e-6f) return crudo + (sy - sx) / nF;
+  float m = (nF * sxy - sx * sy) / denom;
+  float b = (sy - m * sx) / nF;
+  return m * crudo + b;
 }
 
-void guardarCal() {
+void guardarCal(const String &parametro) {
+  Calibracion &c = calDe(parametro);
   memoriaCal.begin("acuario", false);
-  memoriaCal.putFloat("v1", calV1);
-  memoriaCal.putFloat("p1", calPh1);
-  memoriaCal.putFloat("v2", calV2);
-  memoriaCal.putFloat("p2", calPh2);
-  memoriaCal.putBool("c1", cal1);
-  memoriaCal.putBool("c2", cal2);
-  memoriaCal.putFloat("tc", calTc);
+  String clave = "cal_" + parametro;
+  memoriaCal.putBytes(clave.c_str(), &c, sizeof(Calibracion));
   memoriaCal.end();
 }
 
-void cargarCal() {
+void cargarCalibraciones() {
   memoriaCal.begin("acuario", true);
-  calV1 = memoriaCal.getFloat("v1", 0);
-  calPh1 = memoriaCal.getFloat("p1", 0);
-  calV2 = memoriaCal.getFloat("v2", 0);
-  calPh2 = memoriaCal.getFloat("p2", 0);
-  cal1 = memoriaCal.getBool("c1", false);
-  cal2 = memoriaCal.getBool("c2", false);
-  calTc = memoriaCal.getFloat("tc", 25.0f);
+  if (memoriaCal.isKey("cal_TEMP")) memoriaCal.getBytes("cal_TEMP", &calTemp, sizeof(Calibracion));
+  if (memoriaCal.isKey("cal_PH")) memoriaCal.getBytes("cal_PH", &calPh, sizeof(Calibracion));
+  if (memoriaCal.isKey("cal_COND")) memoriaCal.getBytes("cal_COND", &calCond, sizeof(Calibracion));
   memoriaCal.end();
+}
+
+uint8_t codigoParametro(const String &parametro) {
+  if (parametro == "TEMP") return 0;
+  if (parametro == "PH") return 1;
+  return 2;
+}
+
+const char* nombreParametro(uint8_t codigo) {
+  if (codigo == 0) return "TEMP";
+  if (codigo == 1) return "PH";
+  return "COND";
+}
+
+void iniciarBufferPendientes() {
+  if (!LittleFS.begin(true)) {
+    Serial.println("No se pudo montar LittleFS: el buffer offline no va a funcionar");
+    return;
+  }
+  memoriaBuffer.begin("buffer", false);
+  bufferCabeza = memoriaBuffer.getUInt("cabeza", 0);
+  bufferCola = memoriaBuffer.getUInt("cola", 0);
+  bufferCantidad = memoriaBuffer.getUInt("cantidad", 0);
+
+  if (!LittleFS.exists(ARCHIVO_PENDIENTES)) {
+    File f = LittleFS.open(ARCHIVO_PENDIENTES, "w");
+    if (f) f.close();
+  }
+  Serial.printf("Buffer offline: %u lecturas pendientes de una sesion anterior\n", bufferCantidad);
+}
+
+void guardarMetaBuffer() {
+  memoriaBuffer.putUInt("cabeza", bufferCabeza);
+  memoriaBuffer.putUInt("cola", bufferCola);
+  memoriaBuffer.putUInt("cantidad", bufferCantidad);
+}
+
+bool escribirRegistroPendiente(uint32_t indice, const RegistroPendiente &registro) {
+  File f = LittleFS.open(ARCHIVO_PENDIENTES, "r+");
+  if (!f) return false;
+  f.seek(indice * sizeof(RegistroPendiente));
+  size_t escritos = f.write((const uint8_t*)&registro, sizeof(registro));
+  f.close();
+  return escritos == sizeof(registro);
+}
+
+bool leerRegistroPendiente(uint32_t indice, RegistroPendiente &registro) {
+  File f = LittleFS.open(ARCHIVO_PENDIENTES, "r");
+  if (!f) return false;
+  f.seek(indice * sizeof(RegistroPendiente));
+  size_t leidos = f.read((uint8_t*)&registro, sizeof(registro));
+  f.close();
+  return leidos == sizeof(registro);
+}
+
+void guardarLecturaPendiente(const String &parametro, float valor, uint32_t marcaTemporal) {
+  RegistroPendiente registro{ marcaTemporal, codigoParametro(parametro), valor };
+  if (!escribirRegistroPendiente(bufferCola, registro)) {
+    Serial.println("Buffer offline: no se pudo escribir en la memoria flash");
+    return;
+  }
+
+  bufferCola = (bufferCola + 1) % CAPACIDAD_REGISTROS_PENDIENTES;
+  if (bufferCantidad < CAPACIDAD_REGISTROS_PENDIENTES) {
+    bufferCantidad++;
+  } else {
+    bufferCabeza = (bufferCabeza + 1) % CAPACIDAD_REGISTROS_PENDIENTES;
+  }
+  guardarMetaBuffer();
+  Serial.printf("Sin conexion: medicion guardada (%s=%.2f), %u pendientes\n",
+                parametro.c_str(), valor, bufferCantidad);
+}
+
+void reenviarPendientes(uint32_t maxGrupos) {
+  uint32_t gruposEnviados = 0;
+
+  while (bufferCantidad > 0 && mqttClient.connected() && gruposEnviados < maxGrupos) {
+    RegistroPendiente primero;
+    if (!leerRegistroPendiente(bufferCabeza, primero)) {
+      Serial.println("Buffer offline: no se pudo leer un registro pendiente");
+      return;
+    }
+
+    char marcaTexto[25];
+    time_t t = (time_t)primero.marcaTemporal;
+    strftime(marcaTexto, sizeof(marcaTexto), "%Y-%m-%dT%H:%M:%SZ", gmtime(&t));
+
+    JsonDocument doc;
+    doc["marcaTemporal"] = marcaTexto;
+    JsonArray lecturas = doc["lecturas"].to<JsonArray>();
+    JsonObject l = lecturas.add<JsonObject>();
+    l["parametro"] = nombreParametro(primero.parametro);
+    l["valor"] = primero.valor;
+
+    uint32_t agrupados = 1;
+    while (agrupados < 3 && agrupados < bufferCantidad) {
+      RegistroPendiente siguiente;
+      uint32_t indiceSiguiente = (bufferCabeza + agrupados) % CAPACIDAD_REGISTROS_PENDIENTES;
+      if (!leerRegistroPendiente(indiceSiguiente, siguiente)) break;
+      if (siguiente.marcaTemporal != primero.marcaTemporal) break;
+
+      JsonObject lSiguiente = lecturas.add<JsonObject>();
+      lSiguiente["parametro"] = nombreParametro(siguiente.parametro);
+      lSiguiente["valor"] = siguiente.valor;
+      agrupados++;
+    }
+
+    char buffer[256];
+    serializeJson(doc, buffer);
+    String topic = "acuarios/" + String(IDENTIFICADOR_HARDWARE) + "/mediciones";
+    if (!mqttClient.publish(topic.c_str(), buffer)) {
+      Serial.println("Buffer offline: fallo el reenvio, se reintenta en la proxima vuelta");
+      return;
+    }
+
+    bufferCabeza = (bufferCabeza + agrupados) % CAPACIDAD_REGISTROS_PENDIENTES;
+    bufferCantidad -= agrupados;
+    guardarMetaBuffer();
+    gruposEnviados++;
+    mqttClient.loop();
+  }
+
+  if (bufferCantidad == 0 && gruposEnviados > 0) {
+    Serial.println("Buffer offline: todas las lecturas pendientes fueron enviadas");
+  }
 }
 
 const char* veredictoTds(float mv, uint32_t dispersion, uint32_t deriva) {
@@ -439,10 +645,25 @@ const char* veredictoPh(float mv, uint32_t dispersion, uint32_t deriva) {
   return "OK";
 }
 
+void iniciarRtc() {
+  hayRtc = rtc.begin();
+  if (!hayRtc) {
+    Serial.println("Modulo RTC no detectado");
+    return;
+  }
+  if (rtc.lostPower()) {
+    Serial.println("RTC sin hora valida (se ajustara al sincronizar por NTP)");
+    return;
+  }
+  struct timeval tv = { (time_t)rtc.now().unixtime(), 0 };
+  settimeofday(&tv, nullptr);
+  Serial.println("Hora tomada del modulo RTC al arrancar");
+}
+
 void iniciarSensores() {
   analogSetPinAttenuation(PIN_TDS, ADC_11db);
   analogSetPinAttenuation(PIN_PH, ADC_11db);
-  cargarCal();
+  cargarCalibraciones();
   ds.begin();
   ds.setResolution(12);
   hayDs = ds.getAddress(romDs, 0);
@@ -452,11 +673,28 @@ void iniciarSensores() {
   } else {
     Serial.println("DS18B20 no detectado en GPIO 4");
   }
-  Serial.print("Calibracion de pH: ");
-  Serial.println(estadoCal());
+  Serial.printf("Calibracion: TEMP %d/3, PH %d/3, COND %d/3 puntos\n", calTemp.n, calPh.n, calCond.n);
 }
 
 void leerSensores() {
+  if (SIMULAR_SENSORES) {
+    float tCrudo = valorSimulado("TEMP");
+    float phCrudo = valorSimulado("PH");
+    float condCrudo = valorSimulado("COND");
+
+    tempValida = true;
+    phValida = true;
+    condValida = true;
+    ultimaTempOk = tCrudo;
+    temperatura = aplicarCorreccion(calTemp, tCrudo);
+    ph = aplicarCorreccion(calPh, phCrudo);
+    conductividad = aplicarCorreccion(calCond, condCrudo);
+
+    Serial.printf("[SIMULADO] temp %.2f C | pH %.2f | cond %.0f uS/cm\n",
+                  temperatura, ph, conductividad);
+    return;
+  }
+
   uint32_t mn, mx;
 
   digitalWrite(PIN_TDS_PWR, LOW);
@@ -476,8 +714,8 @@ void leerSensores() {
   }
   tempValida = hayDs && !isnan(t) && t != 85.0f;
   if (tempValida) {
-    temperatura = t;
     ultimaTempOk = t;
+    temperatura = aplicarCorreccion(calTemp, t);
   }
 
   delay(MS_ASENTAR_PH);
@@ -487,7 +725,7 @@ void leerSensores() {
   ultimoPo = (phMv / 1000.0f) / K_DIVISOR;
   const char* vPh = veredictoPh(phMv, phDispersion, histPh.rango());
   phValida = strcmp(vPh, "OK") == 0;
-  if (phValida) ph = phDesdePo(ultimoPo, ultimaTempOk);
+  if (phValida) ph = aplicarCorreccion(calPh, phNominal(ultimoPo, ultimaTempOk));
 
   digitalWrite(PIN_TDS_PWR, HIGH);
   delay(MS_ASENTAR_TDS);
@@ -497,7 +735,7 @@ void leerSensores() {
   histTds.push(tdsMv);
   const char* vTds = veredictoTds(tdsMv, tdsDispersion, histTds.rango());
   condValida = strcmp(vTds, "OK") == 0;
-  if (condValida) conductividad = usPorCmDesde(tdsMv, tempValida ? temperatura : 25.0f);
+  if (condValida) conductividad = aplicarCorreccion(calCond, usPorCmDesde(tdsMv, tempValida ? ultimaTempOk : 25.0f));
 
   if (tempValida) Serial.printf("temp %.2f C", temperatura);
   else Serial.print("temp sin lectura valida");
@@ -505,15 +743,27 @@ void leerSensores() {
   Serial.printf(" | cond %.0f uS/cm [%s]\n", conductividad, vTds);
 }
 
-void publicarLecturas() {
+void publicarOGuardarLecturas() {
   if (!tempValida && !phValida && !condValida) {
     Serial.println("Ninguna lectura valida: no se publica nada");
     return;
   }
 
   time_t ahora = time(nullptr);
+
+  if (mqttClient.connected()) {
+    publicarLecturas(ahora);
+    return;
+  }
+
+  if (tempValida) guardarLecturaPendiente("TEMP", temperatura, (uint32_t)ahora);
+  if (phValida) guardarLecturaPendiente("PH", ph, (uint32_t)ahora);
+  if (condValida) guardarLecturaPendiente("COND", conductividad, (uint32_t)ahora);
+}
+
+void publicarLecturas(time_t marcaTemporalEpoch) {
   char marcaTemporal[25];
-  strftime(marcaTemporal, sizeof(marcaTemporal), "%Y-%m-%dT%H:%M:%SZ", gmtime(&ahora));
+  strftime(marcaTemporal, sizeof(marcaTemporal), "%Y-%m-%dT%H:%M:%SZ", gmtime(&marcaTemporalEpoch));
 
   JsonDocument doc;
   doc["marcaTemporal"] = marcaTemporal;
@@ -548,34 +798,229 @@ void publicarLecturas() {
 }
 
 void ayudaCalibracion() {
-  Serial.println("Comandos disponibles:");
-  Serial.println("  c7  -> tomar la lectura actual como pH 7");
-  Serial.println("  c4  -> tomar la lectura actual como pH 4");
-  Serial.println("  c10 -> tomar la lectura actual como pH 10");
-  Serial.println("  cr  -> borrar la calibracion guardada");
-  Serial.println("  ?   -> esta ayuda");
+  Serial.println("Comandos disponibles (PARAM = TEMP, PH o COND):");
+  Serial.println("  leer PARAM              -> lectura cruda y corregida");
+  Serial.println("  cal PARAM PUNTO VALOR   -> fija el punto 1, 2 o 3 (ej: cal PH 1 6.86)");
+  Serial.println("  cal borrar PARAM        -> borra la calibracion de ese parametro");
+  Serial.println("  estado                  -> puntos fijados, buffer y conexion");
+  Serial.println("  ?                       -> esta ayuda");
 }
 
-void fijarPunto(float phReferencia) {
+void estadoCalibraciones() {
+  Serial.printf("TEMP %d/3 | PH %d/3 | COND %d/3 puntos fijados\n",
+                calTemp.n, calPh.n, calCond.n);
+}
+
+float medirPoPh() {
   digitalWrite(PIN_TDS_PWR, LOW);
   delay(MS_ASENTAR_PH);
   uint32_t mn, mx;
   float mv = leerMv(PIN_PH, 48, mn, mx);
-  ultimoPo = (mv / 1000.0f) / K_DIVISOR;
+  return (mv / 1000.0f) / K_DIVISOR;
+}
 
-  if (!cal1) {
-    calV1 = ultimoPo;
-    calPh1 = phReferencia;
-    cal1 = true;
-  } else {
-    calV2 = ultimoPo;
-    calPh2 = phReferencia;
-    cal2 = true;
+float medirCrudo(const String &parametro) {
+  if (SIMULAR_SENSORES) return valorSimulado(parametro);
+
+  if (parametro == "TEMP") {
+    if (!hayDs) return NAN;
+    ds.requestTemperatures();
+    float t = ds.getTempC(romDs);
+    if (t == DEVICE_DISCONNECTED_C || t == 85.0f) return NAN;
+    return t;
   }
-  calTc = isnan(ultimaTempOk) ? 25.0f : ultimaTempOk;
-  guardarCal();
-  Serial.printf("Guardado: %.3f V = pH %.2f a %.1f C (%s)\n",
-                ultimoPo, phReferencia, calTc, estadoCal());
+  if (parametro == "PH") {
+    return phNominal(medirPoPh(), ultimaTempOk);
+  }
+  if (parametro == "COND") {
+    digitalWrite(PIN_TDS_PWR, HIGH);
+    delay(MS_ASENTAR_TDS);
+    uint32_t mn, mx;
+    float mv = leerMv(PIN_TDS, 32, mn, mx);
+    digitalWrite(PIN_TDS_PWR, LOW);
+    return usPorCmDesde(mv, isnan(ultimaTempOk) ? 25.0f : ultimaTempOk);
+  }
+  return NAN;
+}
+
+bool fijarPuntoCalibracion(const String &parametro, int punto, float valorReferencia,
+                           float &antes, float &despues, const char *&error) {
+  if (!parametroValido(parametro)) {
+    error = "parametro desconocido";
+    return false;
+  }
+  if (punto < 1 || punto > 3) {
+    error = "el punto debe ser 1, 2 o 3";
+    return false;
+  }
+  float crudo = medirCrudo(parametro);
+  if (isnan(crudo)) {
+    error = "no se pudo tomar la lectura";
+    return false;
+  }
+  Calibracion &c = calDe(parametro);
+  antes = aplicarCorreccion(c, crudo);
+  c.x[punto - 1] = crudo;
+  c.y[punto - 1] = valorReferencia;
+  if (punto > c.n) c.n = punto;
+  guardarCal(parametro);
+  despues = aplicarCorreccion(c, crudo);
+  return true;
+}
+
+void publicarRespuestaCalibracion(JsonDocument &resp) {
+  char buffer[320];
+  serializeJson(resp, buffer);
+  String topic = "acuarios/" + String(IDENTIFICADOR_HARDWARE) + "/calibracion/respuesta";
+  mqttClient.publish(topic.c_str(), buffer);
+  Serial.print("Calibracion, respuesta publicada: ");
+  Serial.println(buffer);
+}
+
+void manejarComandoCalibracion(byte *payload, unsigned int length) {
+  JsonDocument doc;
+  if (deserializeJson(doc, payload, length)) {
+    Serial.println("Calibracion: comando con JSON invalido");
+    return;
+  }
+
+  String solicitudId = doc["solicitudId"] | "";
+  String accion = doc["accion"] | "";
+  String parametro = doc["parametro"] | "";
+
+  JsonDocument resp;
+  resp["solicitudId"] = solicitudId;
+
+  if (!parametroValido(parametro)) {
+    resp["ok"] = false;
+    resp["error"] = "parametro desconocido";
+  } else if (accion == "leer") {
+    float valor = medirCrudo(parametro);
+    if (isnan(valor)) {
+      resp["ok"] = false;
+      resp["error"] = "no se pudo tomar la lectura";
+    } else {
+      resp["ok"] = true;
+      resp["lectura"] = valor;
+    }
+  } else if (accion == "fijarPunto") {
+    if (!doc["valorReferencia"].is<float>()) {
+      resp["ok"] = false;
+      resp["error"] = "falta el valor de referencia";
+    } else {
+      int punto = doc["punto"] | 0;
+      float antes, despues;
+      const char *error = "";
+      float valorReferencia = doc["valorReferencia"];
+      if (fijarPuntoCalibracion(parametro, punto, valorReferencia, antes, despues, error)) {
+        resp["ok"] = true;
+        resp["lecturaAntes"] = antes;
+        resp["lecturaDespues"] = despues;
+      } else {
+        resp["ok"] = false;
+        resp["error"] = error;
+      }
+    }
+  } else {
+    resp["ok"] = false;
+    resp["error"] = "accion desconocida";
+  }
+
+  publicarRespuestaCalibracion(resp);
+}
+
+void manejarMensajeMqtt(char *topic, byte *payload, unsigned int length) {
+  String t = String(topic);
+  if (t.endsWith("/calibracion/comando")) {
+    manejarComandoCalibracion(payload, length);
+  }
+}
+
+String tokenSerie(const String &linea, int indice) {
+  int inicio = 0;
+  for (int i = 0; i < indice; i++) {
+    inicio = linea.indexOf(' ', inicio);
+    if (inicio < 0) return "";
+    while (inicio < (int)linea.length() && linea[inicio] == ' ') inicio++;
+  }
+  int fin = linea.indexOf(' ', inicio);
+  return fin < 0 ? linea.substring(inicio) : linea.substring(inicio, fin);
+}
+
+void procesarComandoSerie(const String &linea) {
+  String comando = tokenSerie(linea, 0);
+  comando.toLowerCase();
+
+  if (comando == "?") {
+    ayudaCalibracion();
+    return;
+  }
+
+  if (comando == "estado") {
+    estadoCalibraciones();
+    Serial.printf("Buffer offline: %u/%u lecturas pendientes de envio\n",
+                  bufferCantidad, CAPACIDAD_REGISTROS_PENDIENTES);
+    Serial.printf("Conexion: %s\n", estadoConexion());
+    return;
+  }
+
+  if (comando == "leer") {
+    String parametro = tokenSerie(linea, 1);
+    parametro.toUpperCase();
+    if (!parametroValido(parametro)) {
+      Serial.println("Parametro invalido. Use TEMP, PH o COND");
+      return;
+    }
+    float crudo = medirCrudo(parametro);
+    if (isnan(crudo)) {
+      Serial.println("No se pudo tomar la lectura");
+      return;
+    }
+    Serial.printf("%s: crudo %.2f | corregido %.2f\n",
+                  parametro.c_str(), crudo, aplicarCorreccion(calDe(parametro), crudo));
+    return;
+  }
+
+  if (comando == "cal") {
+    String segundo = tokenSerie(linea, 1);
+    String segundoMinuscula = segundo;
+    segundoMinuscula.toLowerCase();
+
+    if (segundoMinuscula == "borrar") {
+      String parametro = tokenSerie(linea, 2);
+      parametro.toUpperCase();
+      if (!parametroValido(parametro)) {
+        Serial.println("Parametro invalido. Use TEMP, PH o COND");
+        return;
+      }
+      calDe(parametro) = Calibracion();
+      guardarCal(parametro);
+      Serial.printf("Calibracion de %s borrada\n", parametro.c_str());
+      return;
+    }
+
+    String parametro = segundo;
+    parametro.toUpperCase();
+    String puntoTexto = tokenSerie(linea, 2);
+    String valorTexto = tokenSerie(linea, 3);
+    if (puntoTexto == "" || valorTexto == "") {
+      Serial.println("Faltan datos. Ejemplo: cal PH 1 6.86");
+      return;
+    }
+
+    float antes, despues;
+    const char *error = "";
+    if (!fijarPuntoCalibracion(parametro, puntoTexto.toInt(), valorTexto.toFloat(), antes, despues, error)) {
+      Serial.printf("No se pudo fijar el punto: %s\n", error);
+      return;
+    }
+    Serial.printf("%s punto %s fijado en %s -> antes %.2f, despues %.2f\n",
+                  parametro.c_str(), puntoTexto.c_str(), valorTexto.c_str(), antes, despues);
+    estadoCalibraciones();
+    return;
+  }
+
+  Serial.println("Comando desconocido. Escribi ? para ver la ayuda");
 }
 
 void atenderComandosSerie() {
@@ -584,21 +1029,60 @@ void atenderComandosSerie() {
     char c = Serial.read();
     if (c == '\n' || c == '\r') {
       linea.trim();
-      linea.toLowerCase();
-      if (linea == "c7") fijarPunto(7.0f);
-      else if (linea == "c4") fijarPunto(4.0f);
-      else if (linea == "c10") fijarPunto(10.0f);
-      else if (linea == "cr") {
-        cal1 = false;
-        cal2 = false;
-        guardarCal();
-        Serial.println("Calibracion borrada");
-      }
-      else if (linea == "?") ayudaCalibracion();
-      else if (linea.length()) Serial.println("Comando desconocido. Escribi ? para ver la ayuda");
+      if (linea.length()) procesarComandoSerie(linea);
       linea = "";
-    } else if (linea.length() < 32) {
+    } else if (linea.length() < 48) {
       linea += c;
     }
   }
+}
+
+void iniciarDisplay() {
+  Wire.beginTransmission(DIRECCION_DISPLAY);
+  hayDisplay = Wire.endTransmission() == 0;
+  if (!hayDisplay) {
+    Serial.println("Display no detectado: la placa mide igual");
+    return;
+  }
+  display.begin();
+  display.setContrast(160);
+  mostrarMensajeEnDisplay("Acuario IoT", "iniciando...", "");
+}
+
+void mostrarMensajeEnDisplay(const char* titulo, const char* linea1, const char* linea2) {
+  if (!hayDisplay) return;
+  display.clearBuffer();
+  display.setFont(u8g2_font_helvB10_tf);
+  display.drawStr(0, 14, titulo);
+  display.setFont(u8g2_font_6x12_tf);
+  display.drawStr(0, 36, linea1);
+  display.drawStr(0, 52, linea2);
+  display.sendBuffer();
+}
+
+const char* estadoConexion() {
+  if (WiFi.status() != WL_CONNECTED) return "Sin WiFi";
+  if (!mqttClient.connected()) return "WiFi OK - sin MQTT";
+  return "Conectado";
+}
+
+void mostrarEnDisplay() {
+  if (!hayDisplay) return;
+  char valor[24];
+  display.clearBuffer();
+  display.setFont(u8g2_font_6x12_tf);
+  display.drawStr(0, 12, "Temp");
+  display.drawStr(0, 30, "pH");
+  display.drawStr(0, 48, "EC");
+  display.setFont(u8g2_font_helvB12_tf);
+  if (tempValida) snprintf(valor, sizeof valor, "%.1f C", temperatura); else strlcpy(valor, "--", sizeof valor);
+  display.drawStr(34, 13, valor);
+  if (phValida) snprintf(valor, sizeof valor, "%.2f", ph); else strlcpy(valor, "--", sizeof valor);
+  display.drawStr(34, 31, valor);
+  if (condValida) snprintf(valor, sizeof valor, "%.0f uS", conductividad); else strlcpy(valor, "--", sizeof valor);
+  display.drawStr(34, 49, valor);
+  display.drawHLine(0, 53, 128);
+  display.setFont(u8g2_font_5x8_tf);
+  display.drawStr(0, 63, estadoConexion());
+  display.sendBuffer();
 }

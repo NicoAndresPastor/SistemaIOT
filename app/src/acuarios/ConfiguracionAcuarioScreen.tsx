@@ -142,7 +142,11 @@ export function ConfiguracionAcuarioScreen() {
                 : navigation.getParent<StackNavegacion>()?.navigate('VincularDispositivo', { acuario })
             }
           />
-          <FilaMenu icono="options-outline" etiqueta="Calibrar un sensor" onPress={proximamente} />
+          <FilaMenu
+            icono="options-outline"
+            etiqueta="Calibrar un sensor"
+            onPress={() => navigation.getParent<StackNavegacion>()?.navigate('CalibrarSensor', { acuario })}
+          />
           <FilaMenu icono="trash-outline" etiqueta="Eliminar acuario" onPress={manejarEliminar} ultima />
         </SeccionMenu>
       </ScrollView>

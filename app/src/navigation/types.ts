@@ -12,6 +12,7 @@ export type ApplicationStackParamList = {
   EditarNombreAcuario: { acuario: Acuario };
   VincularDispositivo: { acuario: Acuario };
   DesvincularDispositivo: { acuario: Acuario };
+  CalibrarSensor: { acuario: Acuario };
   MiCuenta: undefined;
 };
 

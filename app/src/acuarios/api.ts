@@ -83,3 +83,50 @@ export function vincularDispositivo(
 export function desvincularDispositivo(accessToken: string, id: string): Promise<void> {
   return pedir<void>(`/acuarios/${id}/dispositivo`, { method: 'DELETE', accessToken });
 }
+
+export type ParametroCalibrable = 'TEMP' | 'PH' | 'COND';
+
+export interface PuntoCalibracion {
+  valorReferencia: number;
+  lecturaAntes: number;
+  lecturaDespues: number;
+}
+
+export function calibrarLeer(
+  accessToken: string,
+  id: string,
+  parametro: ParametroCalibrable
+): Promise<{ lectura: number }> {
+  return pedir<{ lectura: number }>(`/acuarios/${id}/calibracion/leer`, {
+    method: 'POST',
+    accessToken,
+    body: { parametro },
+  });
+}
+
+export function calibrarPunto(
+  accessToken: string,
+  id: string,
+  parametro: ParametroCalibrable,
+  punto: number,
+  valorReferencia: number
+): Promise<{ lecturaAntes: number; lecturaDespues: number }> {
+  return pedir<{ lecturaAntes: number; lecturaDespues: number }>(`/acuarios/${id}/calibracion/punto`, {
+    method: 'POST',
+    accessToken,
+    body: { parametro, punto, valorReferencia },
+  });
+}
+
+export function calibrarGuardar(
+  accessToken: string,
+  id: string,
+  parametro: ParametroCalibrable,
+  puntos: PuntoCalibracion[]
+): Promise<{ id: string; fechaHora: string; puntos: number }> {
+  return pedir<{ id: string; fechaHora: string; puntos: number }>(`/acuarios/${id}/calibracion`, {
+    method: 'POST',
+    accessToken,
+    body: { parametro, puntos },
+  });
+}
