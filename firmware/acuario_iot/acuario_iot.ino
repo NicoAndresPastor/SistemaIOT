@@ -29,6 +29,14 @@ const int PIN_TDS_PWR = 19;
 const int PIN_TDS = 35;
 const int PIN_PH = 32;
 
+// Enchufe inteligente: modulo de reles de 2 canales (activo en LOW).
+// Encendido = el pin tira a GND; apagado = el pin queda en alta impedancia
+// y el pull-up del propio modulo deja el rele en reposo. Asi la ESP32 nunca
+// pone 3,3 V contra los 5 V del modulo y el rele no pega al arrancar.
+const int CANTIDAD_ENCHUFES = 2;
+const int PIN_ENCHUFE[CANTIDAD_ENCHUFES] = {23, 17};
+bool enchufeEncendido[CANTIDAD_ENCHUFES] = {false, false};
+
 const int PIN_SDA = 21;
 const int PIN_SCL = 22;
 const uint8_t DIRECCION_DISPLAY = 0x3C;
@@ -51,6 +59,7 @@ const float PH_V_POR_UNIDAD = 0.175f;
 Preferences preferencias;
 Preferences memoriaCal;
 Preferences memoriaBuffer;
+Preferences memoriaEnchufes;
 WebServer servidorConfig(80);
 DNSServer dnsServer;
 WiFiClient wifiClient;
@@ -122,6 +131,7 @@ struct Historia {
 Historia histTds, histPh;
 
 void setup() {
+  iniciarEnchufes();
   pinMode(PIN_TDS_PWR, OUTPUT);
   digitalWrite(PIN_TDS_PWR, LOW);
 
@@ -415,6 +425,9 @@ void intentarConectarMqtt() {
     Serial.println(" conectado");
     String topicComando = "acuarios/" + String(IDENTIFICADOR_HARDWARE) + "/calibracion/comando";
     mqttClient.subscribe(topicComando.c_str());
+    String topicEnchufes = "acuarios/" + String(IDENTIFICADOR_HARDWARE) + "/enchufes/comando";
+    mqttClient.subscribe(topicEnchufes.c_str());
+    publicarEstadoEnchufes();
     intervaloReintentoMqtt = INTERVALO_REINTENTO_MQTT_INICIAL_MS;
     if (bufferCantidad > 0) {
       Serial.printf("Conexion restablecida: enviando %u lecturas pendientes\n", bufferCantidad);
@@ -803,6 +816,8 @@ void ayudaCalibracion() {
   Serial.println("  cal PARAM PUNTO VALOR   -> fija el punto 1, 2 o 3 (ej: cal PH 1 6.86)");
   Serial.println("  cal borrar PARAM        -> borra la calibracion de ese parametro");
   Serial.println("  estado                  -> puntos fijados, buffer y conexion");
+  Serial.println("  enchufe                 -> estado de los 2 enchufes (reles)");
+  Serial.println("  enchufe N on|off        -> prende/apaga el enchufe 1 o 2");
   Serial.println("  ?                       -> esta ayuda");
 }
 
@@ -933,6 +948,68 @@ void manejarMensajeMqtt(char *topic, byte *payload, unsigned int length) {
   String t = String(topic);
   if (t.endsWith("/calibracion/comando")) {
     manejarComandoCalibracion(payload, length);
+  } else if (t.endsWith("/enchufes/comando")) {
+    manejarComandoEnchufes(payload, length);
+  }
+}
+
+void aplicarEnchufe(int indice, bool encendido) {
+  int pin = PIN_ENCHUFE[indice];
+  if (encendido) {
+    digitalWrite(pin, LOW);
+    pinMode(pin, OUTPUT);
+  } else {
+    pinMode(pin, INPUT);
+  }
+  enchufeEncendido[indice] = encendido;
+}
+
+void iniciarEnchufes() {
+  memoriaEnchufes.begin("enchufes", false);
+  for (int i = 0; i < CANTIDAD_ENCHUFES; i++) {
+    String clave = "c" + String(i + 1);
+    aplicarEnchufe(i, memoriaEnchufes.getBool(clave.c_str(), false));
+  }
+}
+
+void publicarEstadoEnchufes() {
+  if (!mqttClient.connected()) return;
+  JsonDocument doc;
+  JsonArray lista = doc["enchufes"].to<JsonArray>();
+  for (int i = 0; i < CANTIDAD_ENCHUFES; i++) {
+    JsonObject e = lista.add<JsonObject>();
+    e["canal"] = i + 1;
+    e["encendido"] = enchufeEncendido[i];
+  }
+  char buffer[160];
+  size_t n = serializeJson(doc, buffer, sizeof(buffer));
+  String topic = "acuarios/" + String(IDENTIFICADOR_HARDWARE) + "/enchufes/estado";
+  mqttClient.publish(topic.c_str(), (const uint8_t *)buffer, n, true);
+}
+
+bool cambiarEnchufe(int canal, bool encendido) {
+  if (canal < 1 || canal > CANTIDAD_ENCHUFES) return false;
+  aplicarEnchufe(canal - 1, encendido);
+  String clave = "c" + String(canal);
+  memoriaEnchufes.putBool(clave.c_str(), encendido);
+  Serial.printf("Enchufe %d %s\n", canal, encendido ? "ENCENDIDO" : "APAGADO");
+  publicarEstadoEnchufes();
+  return true;
+}
+
+// Payload: {"canal":1,"encendido":true}
+void manejarComandoEnchufes(byte *payload, unsigned int length) {
+  JsonDocument doc;
+  if (deserializeJson(doc, payload, length)) {
+    Serial.println("Comando de enchufe con JSON invalido");
+    return;
+  }
+  if (!doc["canal"].is<int>() || !doc["encendido"].is<bool>()) {
+    Serial.println("Comando de enchufe incompleto: falta canal o encendido");
+    return;
+  }
+  if (!cambiarEnchufe(doc["canal"].as<int>(), doc["encendido"].as<bool>())) {
+    Serial.println("Canal de enchufe invalido");
   }
 }
 
@@ -978,6 +1055,27 @@ void procesarComandoSerie(const String &linea) {
     }
     Serial.printf("%s: crudo %.2f | corregido %.2f\n",
                   parametro.c_str(), crudo, aplicarCorreccion(calDe(parametro), crudo));
+    return;
+  }
+
+  if (comando == "enchufe") {
+    String canalTexto = tokenSerie(linea, 1);
+    String accion = tokenSerie(linea, 2);
+    accion.toLowerCase();
+    if (canalTexto == "") {
+      for (int i = 0; i < CANTIDAD_ENCHUFES; i++) {
+        Serial.printf("Enchufe %d (GPIO %d): %s\n", i + 1, PIN_ENCHUFE[i],
+                      enchufeEncendido[i] ? "ENCENDIDO" : "APAGADO");
+      }
+      return;
+    }
+    if (accion != "on" && accion != "off") {
+      Serial.println("Uso: enchufe <1|2> <on|off>  (o solo 'enchufe' para ver el estado)");
+      return;
+    }
+    if (!cambiarEnchufe(canalTexto.toInt(), accion == "on")) {
+      Serial.println("Canal invalido. Use 1 o 2");
+    }
     return;
   }
 
