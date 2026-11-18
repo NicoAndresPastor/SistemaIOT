@@ -1,6 +1,7 @@
 import mqtt from 'mqtt';
 import { pool } from '../db';
 import { manejarRespuestaCalibracion } from './calibracion';
+import { manejarEstadoReportado, TOPIC_ENCHUFES_REPORTADO } from './enchufes';
 
 const BROKER_URL = process.env.MQTT_BROKER_URL ?? 'mqtt://localhost:1883';
 const TOPIC_MEDICIONES = 'acuarios/+/mediciones';
@@ -27,11 +28,29 @@ export function iniciarSuscriptorMqtt() {
     console.log('MQTT: conectado al broker', BROKER_URL);
     client.subscribe(TOPIC_MEDICIONES);
     client.subscribe(TOPIC_CALIBRACION_RESPUESTA);
+    // QoS 1 en la suscripcion: le pide al broker que, si el mensaje retenido
+    // o uno nuevo se publico con QoS 1, tambien se lo entregue con QoS 1 al
+    // backend (como minimo una vez), en vez de degradarlo a QoS 0.
+    client.subscribe(TOPIC_ENCHUFES_REPORTADO, { qos: 1 });
   });
 
   client.on('message', (topic, payload) => {
     if (topic.endsWith('/calibracion/respuesta')) {
       manejarRespuestaCalibracion(payload);
+      return;
+    }
+    // acuarios/{identificador}/enchufes/{canal}/reportado
+    const partes = topic.split('/');
+    if (partes.length === 5 && partes[2] === 'enchufes' && partes[4] === 'reportado') {
+      const identificadorHardware = partes[1];
+      const canal = Number(partes[3]);
+      if (!Number.isInteger(canal)) {
+        console.warn('MQTT: topico de enchufe reportado con canal invalido', topic);
+        return;
+      }
+      manejarEstadoReportado(identificadorHardware, canal, payload).catch((error) => {
+        console.error('MQTT: error procesando estado reportado de', topic, error);
+      });
       return;
     }
     procesarMensaje(topic, payload).catch((error) => {

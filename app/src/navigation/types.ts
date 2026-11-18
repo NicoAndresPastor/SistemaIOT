@@ -1,4 +1,4 @@
-import type { Acuario } from '../acuarios/api';
+import type { Acuario, EntradaBitacora } from '../acuarios/api';
 
 export type AuthStackParamList = {
   Login: undefined;
@@ -13,13 +13,14 @@ export type ApplicationStackParamList = {
   VincularDispositivo: { acuario: Acuario };
   DesvincularDispositivo: { acuario: Acuario };
   CalibrarSensor: { acuario: Acuario };
+  CrearEntradaBitacora: { acuario: Acuario; entrada?: EntradaBitacora };
   MiCuenta: undefined;
 };
 
 export type AcuarioTabParamList = {
   Home: { acuario: Acuario };
   Historial: undefined;
-  Bitacora: undefined;
-  Enchufes: undefined;
+  Bitacora: { acuario: Acuario };
+  Enchufes: { acuario: Acuario };
   Configuracion: { acuario: Acuario };
 };

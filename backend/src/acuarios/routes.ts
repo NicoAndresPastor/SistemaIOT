@@ -1,8 +1,80 @@
 import { Router } from 'express';
+import multer from 'multer';
 import { pool } from '../db';
 import { pedirCalibracion } from '../mqtt/calibracion';
+import { publicarComandoEnchufe } from '../mqtt/enchufes';
+import { subirImagen, borrarImagen, publicIdDesdeUrl } from '../bitacora/cloudinary';
 
 export const acuariosRouter = Router();
+
+const TAMANO_MAXIMO_FOTO_BYTES = 8 * 1024 * 1024;
+
+// Los ids llegan como texto (query string o formulario multipart).
+async function tipoEventoValido(valor: unknown): Promise<number | null> {
+  const id = Number(valor);
+  if (typeof valor !== 'string' || !Number.isInteger(id) || id < 1) return null;
+  const resultado = await pool.query('SELECT id FROM tipo_evento WHERE id = $1', [id]);
+  return resultado.rows.length > 0 ? id : null;
+}
+
+function consultarEntradasBitacora(condicion: string, parametros: unknown[]) {
+  return pool.query(
+    `SELECT e.id, e.tipo_evento_id, t.nombre AS tipo_evento_nombre, e.observacion,
+            e.fecha_evento, e.fecha_registro,
+            COALESCE(
+              json_agg(
+                json_build_object('id', i.id, 'url', i.ruta_archivo, 'nombreArchivo', i.nombre_archivo)
+                ORDER BY i.fecha_carga
+              ) FILTER (WHERE i.id IS NOT NULL),
+              '[]'
+            ) AS imagenes
+     FROM entrada_bitacora e
+     JOIN tipo_evento t ON t.id = e.tipo_evento_id
+     LEFT JOIN imagen i ON i.entrada_bitacora_id = e.id
+     WHERE ${condicion}
+     GROUP BY e.id, t.nombre
+     ORDER BY e.fecha_evento DESC`,
+    parametros
+  );
+}
+
+const subidaFotos = multer({
+  storage: multer.memoryStorage(),
+  limits: { fileSize: TAMANO_MAXIMO_FOTO_BYTES, files: 5 },
+  fileFilter: (req, file, cb) => {
+    if (!['image/jpeg', 'image/png', 'image/webp'].includes(file.mimetype)) {
+      cb(new Error('TIPO_NO_PERMITIDO'));
+      return;
+    }
+    cb(null, true);
+  },
+});
+
+// multer informa sus errores (limite de tamaño, de cantidad, tipo no
+// permitido) llamando a next(err) en vez de lanzar -- se traduce aca a un
+// 400 con el mensaje puntual, en vez de dejar que caiga en el manejador
+// generico de errores (que respondería 500).
+function manejarSubidaFotos(req: import('express').Request, res: import('express').Response, next: import('express').NextFunction) {
+  subidaFotos.array('fotos', 5)(req, res, (err: unknown) => {
+    if (!err) {
+      next();
+      return;
+    }
+    if (err instanceof multer.MulterError && err.code === 'LIMIT_FILE_SIZE') {
+      res.status(400).json({ error: 'Cada foto no puede superar los 8 MB' });
+      return;
+    }
+    if (err instanceof multer.MulterError && err.code === 'LIMIT_FILE_COUNT') {
+      res.status(400).json({ error: 'No se pueden subir mas de 5 fotos' });
+      return;
+    }
+    if (err instanceof Error && err.message === 'TIPO_NO_PERMITIDO') {
+      res.status(400).json({ error: 'Las fotos deben ser JPEG, PNG o WEBP' });
+      return;
+    }
+    res.status(400).json({ error: 'No se pudieron procesar las fotos' });
+  });
+}
 
 // Usado por las tres rutas de calibracion: confirma que el acuario es del
 // usuario y que tiene un dispositivo vinculado, y devuelve tanto su id como
@@ -412,4 +484,273 @@ acuariosRouter.post('/:id/calibracion', async (req, res) => {
   } finally {
     client.release();
   }
+});
+
+// GET /acuarios/:id/bitacora  (CU-23: listar y filtrar por tipo de evento)
+acuariosRouter.get('/:id/bitacora', async (req, res) => {
+  const acuario = await pool.query('SELECT id FROM acuario WHERE id = $1 AND usuario_id = $2', [
+    req.params.id,
+    req.usuarioId,
+  ]);
+  if (acuario.rows.length === 0) {
+    res.status(404).json({ error: 'Acuario no encontrado' });
+    return;
+  }
+
+  if (req.query.tipoEventoId === undefined) {
+    const resultado = await consultarEntradasBitacora('e.acuario_id = $1', [req.params.id]);
+    res.json(resultado.rows);
+    return;
+  }
+
+  const tipoEventoId = await tipoEventoValido(req.query.tipoEventoId);
+  if (tipoEventoId === null) {
+    res.status(400).json({ error: 'Tipo de evento desconocido' });
+    return;
+  }
+  const resultado = await consultarEntradasBitacora('e.acuario_id = $1 AND e.tipo_evento_id = $2', [
+    req.params.id,
+    tipoEventoId,
+  ]);
+  res.json(resultado.rows);
+});
+
+// POST /acuarios/:id/bitacora  (CU-20: crear una entrada con sus fotos)
+acuariosRouter.post('/:id/bitacora', manejarSubidaFotos, async (req, res) => {
+  const acuario = await pool.query('SELECT id FROM acuario WHERE id = $1 AND usuario_id = $2', [
+    req.params.id,
+    req.usuarioId,
+  ]);
+  if (acuario.rows.length === 0) {
+    res.status(404).json({ error: 'Acuario no encontrado' });
+    return;
+  }
+
+  const { observacion, fechaEvento } = req.body;
+  const tipoEventoId = await tipoEventoValido(req.body.tipoEventoId);
+  if (tipoEventoId === null) {
+    res.status(400).json({ error: 'Tipo de evento desconocido' });
+    return;
+  }
+  if (typeof fechaEvento !== 'string' || Number.isNaN(Date.parse(fechaEvento))) {
+    res.status(400).json({ error: 'Falta la fecha del evento' });
+    return;
+  }
+
+  const archivos = (req.files as Express.Multer.File[] | undefined) ?? [];
+
+  const client = await pool.connect();
+  try {
+    await client.query('BEGIN');
+
+    const entradaResultado = await client.query(
+      `INSERT INTO entrada_bitacora (acuario_id, tipo_evento_id, observacion, fecha_evento)
+       VALUES ($1, $2, $3, $4)
+       RETURNING id`,
+      [req.params.id, tipoEventoId, observacion ?? null, fechaEvento]
+    );
+    const entradaId = entradaResultado.rows[0].id;
+
+    for (const archivo of archivos) {
+      const subida = await subirImagen(archivo.buffer);
+      await client.query(
+        `INSERT INTO imagen (entrada_bitacora_id, ruta_archivo, nombre_archivo, tamano_bytes)
+         VALUES ($1, $2, $3, $4)`,
+        [entradaId, subida.url, archivo.originalname, archivo.size]
+      );
+    }
+
+    await client.query('COMMIT');
+    const creada = await consultarEntradasBitacora('e.id = $1', [entradaId]);
+    res.status(201).json(creada.rows[0]);
+  } catch (error) {
+    await client.query('ROLLBACK');
+    throw error;
+  } finally {
+    client.release();
+  }
+});
+
+// DELETE /acuarios/:id/bitacora/:entradaId  (CU-22)
+acuariosRouter.delete('/:id/bitacora/:entradaId', async (req, res) => {
+  const entrada = await pool.query(
+    `SELECT e.id
+     FROM entrada_bitacora e
+     JOIN acuario a ON a.id = e.acuario_id
+     WHERE e.id = $1 AND e.acuario_id = $2 AND a.usuario_id = $3`,
+    [req.params.entradaId, req.params.id, req.usuarioId]
+  );
+  if (entrada.rows.length === 0) {
+    res.status(404).json({ error: 'Entrada no encontrada' });
+    return;
+  }
+
+  const imagenes = await pool.query('SELECT ruta_archivo FROM imagen WHERE entrada_bitacora_id = $1', [
+    req.params.entradaId,
+  ]);
+  for (const fila of imagenes.rows) {
+    const publicId = publicIdDesdeUrl(fila.ruta_archivo);
+    if (publicId) {
+      await borrarImagen(publicId).catch(() => {
+        console.warn('Bitacora: no se pudo borrar una imagen en Cloudinary', publicId);
+      });
+    }
+  }
+
+  await pool.query('DELETE FROM entrada_bitacora WHERE id = $1', [req.params.entradaId]);
+  res.status(204).send();
+});
+
+// PUT /acuarios/:id/bitacora/:entradaId  (editar: datos, sacar fotos existentes y agregar nuevas)
+acuariosRouter.put('/:id/bitacora/:entradaId', manejarSubidaFotos, async (req, res) => {
+  const entrada = await pool.query(
+    `SELECT e.id
+     FROM entrada_bitacora e
+     JOIN acuario a ON a.id = e.acuario_id
+     WHERE e.id = $1 AND e.acuario_id = $2 AND a.usuario_id = $3`,
+    [req.params.entradaId, req.params.id, req.usuarioId]
+  );
+  if (entrada.rows.length === 0) {
+    res.status(404).json({ error: 'Entrada no encontrada' });
+    return;
+  }
+
+  const { observacion, fechaEvento } = req.body;
+  const tipoEventoId = await tipoEventoValido(req.body.tipoEventoId);
+  if (tipoEventoId === null) {
+    res.status(400).json({ error: 'Tipo de evento desconocido' });
+    return;
+  }
+  if (typeof fechaEvento !== 'string' || Number.isNaN(Date.parse(fechaEvento))) {
+    res.status(400).json({ error: 'Falta la fecha del evento' });
+    return;
+  }
+
+  let idsAEliminar: string[] = [];
+  const fotosAEliminar = req.body.fotosAEliminar;
+  if (typeof fotosAEliminar === 'string' && fotosAEliminar.length > 0) {
+    idsAEliminar = fotosAEliminar.split(',');
+  } else if (Array.isArray(fotosAEliminar)) {
+    idsAEliminar = fotosAEliminar;
+  }
+
+  const archivosNuevos = (req.files as Express.Multer.File[] | undefined) ?? [];
+
+  const client = await pool.connect();
+  try {
+    await client.query('BEGIN');
+
+    await client.query(
+      `UPDATE entrada_bitacora SET tipo_evento_id = $1, observacion = $2, fecha_evento = $3 WHERE id = $4`,
+      [tipoEventoId, observacion ?? null, fechaEvento, req.params.entradaId]
+    );
+
+    if (idsAEliminar.length > 0) {
+      const aBorrar = await client.query(
+        `SELECT id, ruta_archivo FROM imagen WHERE entrada_bitacora_id = $1 AND id = ANY($2::uuid[])`,
+        [req.params.entradaId, idsAEliminar]
+      );
+      await client.query(
+        `DELETE FROM imagen WHERE entrada_bitacora_id = $1 AND id = ANY($2::uuid[])`,
+        [req.params.entradaId, idsAEliminar]
+      );
+      for (const fila of aBorrar.rows) {
+        const publicId = publicIdDesdeUrl(fila.ruta_archivo);
+        if (publicId) {
+          await borrarImagen(publicId).catch(() => {
+            console.warn('Bitacora: no se pudo borrar una imagen en Cloudinary', publicId);
+          });
+        }
+      }
+    }
+
+    for (const archivo of archivosNuevos) {
+      const subida = await subirImagen(archivo.buffer);
+      await client.query(
+        `INSERT INTO imagen (entrada_bitacora_id, ruta_archivo, nombre_archivo, tamano_bytes)
+         VALUES ($1, $2, $3, $4)`,
+        [req.params.entradaId, subida.url, archivo.originalname, archivo.size]
+      );
+    }
+
+    await client.query('COMMIT');
+  } catch (error) {
+    await client.query('ROLLBACK');
+    throw error;
+  } finally {
+    client.release();
+  }
+
+  const actualizada = await consultarEntradasBitacora('e.id = $1', [req.params.entradaId]);
+  res.json(actualizada.rows[0]);
+});
+
+// GET /acuarios/:id/enchufes  (CU-29: estado actual de cada enchufe)
+acuariosRouter.get('/:id/enchufes', async (req, res) => {
+  const resuelto = await resolverDispositivoVinculado(req.params.id, req.usuarioId!);
+  if ('error' in resuelto) {
+    res.status(resuelto.error).json({ error: resuelto.mensaje });
+    return;
+  }
+
+  const resultado = await pool.query(
+    'SELECT id, numero_canal, nombre, estado_actual FROM enchufe WHERE dispositivo_id = $1 ORDER BY numero_canal',
+    [resuelto.dispositivoId]
+  );
+  res.json(resultado.rows);
+});
+
+// PUT /acuarios/:id/enchufes/:canal  (CU-28: encender o apagar un enchufe)
+//
+// No espera que la placa confirme: registra la orden, la publica y devuelve
+// 202. El estado real llega despues por MQTT (topico .../reportado), que
+// actualiza el enchufe y marca la orden como confirmada -- la app lo ve al
+// volver a consultar GET /enchufes.
+acuariosRouter.put('/:id/enchufes/:canal', async (req, res) => {
+  const resuelto = await resolverDispositivoVinculado(req.params.id, req.usuarioId!);
+  if ('error' in resuelto) {
+    res.status(resuelto.error).json({ error: resuelto.mensaje });
+    return;
+  }
+
+  const canal = Number(req.params.canal);
+  if (!Number.isInteger(canal) || canal < 1) {
+    res.status(400).json({ error: 'Canal invalido' });
+    return;
+  }
+
+  const { encendido } = req.body;
+  if (typeof encendido !== 'boolean') {
+    res.status(400).json({ error: 'Falta indicar si el enchufe debe encenderse o apagarse' });
+    return;
+  }
+
+  const enchufeActual = await pool.query(
+    'SELECT id, estado_actual FROM enchufe WHERE dispositivo_id = $1 AND numero_canal = $2',
+    [resuelto.dispositivoId, canal]
+  );
+  if (enchufeActual.rows.length === 0) {
+    res.status(404).json({ error: 'Enchufe no encontrado' });
+    return;
+  }
+
+  // Se registra antes de publicar: en una red local la placa puede informar
+  // el nuevo estado en milisegundos, y la confirmacion tiene que encontrar
+  // esta fila ya creada para poder marcarla.
+  const accionamiento = await pool.query(
+    `INSERT INTO accionamiento (enchufe_id, usuario_id, estado_inicial, estado_final)
+     VALUES ($1, $2, $3, $4)
+     RETURNING id`,
+    [enchufeActual.rows[0].id, req.usuarioId, enchufeActual.rows[0].estado_actual, encendido]
+  );
+
+  try {
+    await publicarComandoEnchufe(resuelto.identificadorHardware, canal, encendido);
+  } catch {
+    await pool.query('DELETE FROM accionamiento WHERE id = $1', [accionamiento.rows[0].id]);
+    res.status(504).json({ error: 'No se pudo enviar la orden al dispositivo' });
+    return;
+  }
+
+  res.status(202).json({ canal, encendidoSolicitado: encendido });
 });

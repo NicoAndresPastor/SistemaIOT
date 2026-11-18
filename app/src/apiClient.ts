@@ -15,10 +15,13 @@ interface Cabeceras {
 
 export async function pedir<T>(path: string, opciones: Opciones = {}): Promise<T> {
   const headers: Cabeceras = {};
+  const esFormData = opciones.body instanceof FormData;
 
-  if (opciones.body !== undefined) {
+  if (opciones.body !== undefined && !esFormData) {
     headers['Content-Type'] = 'application/json';
   }
+  // Si el body es FormData no se fija el Content-Type a mano: fetch arma el
+  // suyo solo, con el boundary multipart correspondiente.
 
   if (opciones.accessToken) {
     headers['Authorization'] = `Bearer ${opciones.accessToken}`;
@@ -31,8 +34,10 @@ export async function pedir<T>(path: string, opciones: Opciones = {}): Promise<T
     metodo = opciones.method;
   }
 
-  let cuerpo: string | undefined;
-  if (opciones.body !== undefined) {
+  let cuerpo: string | FormData | undefined;
+  if (esFormData) {
+    cuerpo = opciones.body as FormData;
+  } else if (opciones.body !== undefined) {
     cuerpo = JSON.stringify(opciones.body);
   } else {
     cuerpo = undefined;

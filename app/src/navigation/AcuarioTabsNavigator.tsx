@@ -3,6 +3,8 @@ import { createBottomTabNavigator } from '@react-navigation/bottom-tabs';
 import { Ionicons } from '@expo/vector-icons';
 import { useRoute, type RouteProp } from '@react-navigation/native';
 import { HomeAcuarioScreen } from '../acuarios/HomeAcuarioScreen';
+import { BitacoraScreen } from '../acuarios/BitacoraScreen';
+import { EnchufesScreen } from '../acuarios/EnchufesScreen';
 import { ConfiguracionAcuarioScreen } from '../acuarios/ConfiguracionAcuarioScreen';
 import { colores } from '../ui/colores';
 import type { AcuarioTabParamList, ApplicationStackParamList } from './types';
@@ -68,15 +70,15 @@ export function AcuarioTabsNavigator() {
       />
       <Tab.Screen
         name="Bitacora"
-        component={PantallaInerte}
+        component={BitacoraScreen}
+        initialParams={{ acuario: params.acuario }}
         options={{ tabBarIcon: iconoPestana('book') }}
-        listeners={bloquearNavegacion}
       />
       <Tab.Screen
         name="Enchufes"
-        component={PantallaInerte}
+        component={EnchufesScreen}
+        initialParams={{ acuario: params.acuario }}
         options={{ tabBarIcon: iconoPestana('flash') }}
-        listeners={bloquearNavegacion}
       />
       <Tab.Screen
         name="Configuracion"

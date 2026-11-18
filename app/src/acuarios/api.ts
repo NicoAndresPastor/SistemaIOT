@@ -130,3 +130,129 @@ export function calibrarGuardar(
     body: { parametro, puntos },
   });
 }
+
+export interface TipoEvento {
+  id: number;
+  nombre: string;
+}
+
+export function listarTiposEvento(accessToken: string): Promise<TipoEvento[]> {
+  return pedir<TipoEvento[]>('/tipos-evento', { accessToken });
+}
+
+export interface ImagenBitacora {
+  id: string;
+  url: string;
+  nombreArchivo: string;
+}
+
+export interface EntradaBitacora {
+  id: string;
+  tipo_evento_id: number;
+  tipo_evento_nombre: string;
+  observacion: string | null;
+  fecha_evento: string;
+  fecha_registro: string;
+  imagenes: ImagenBitacora[];
+}
+
+export interface FotoNueva {
+  uri: string;
+  nombre: string;
+  tipo: string;
+}
+
+export function listarBitacora(
+  accessToken: string,
+  acuarioId: string,
+  tipoEventoId?: number
+): Promise<EntradaBitacora[]> {
+  const query = tipoEventoId !== undefined ? `?tipoEventoId=${tipoEventoId}` : '';
+  return pedir<EntradaBitacora[]>(`/acuarios/${acuarioId}/bitacora${query}`, { accessToken });
+}
+
+export function crearEntradaBitacora(
+  accessToken: string,
+  acuarioId: string,
+  datos: { tipoEventoId: number; observacion: string; fechaEvento: string; fotos: FotoNueva[] }
+): Promise<EntradaBitacora> {
+  const formData = new FormData();
+  formData.append('tipoEventoId', String(datos.tipoEventoId));
+  formData.append('observacion', datos.observacion);
+  formData.append('fechaEvento', datos.fechaEvento);
+  for (const foto of datos.fotos) {
+    formData.append(
+      'fotos',
+      { uri: foto.uri, name: foto.nombre, type: foto.tipo } as unknown as Blob
+    );
+  }
+
+  return pedir<EntradaBitacora>(`/acuarios/${acuarioId}/bitacora`, {
+    method: 'POST',
+    accessToken,
+    body: formData,
+  });
+}
+
+export function eliminarEntradaBitacora(
+  accessToken: string,
+  acuarioId: string,
+  entradaId: string
+): Promise<void> {
+  return pedir<void>(`/acuarios/${acuarioId}/bitacora/${entradaId}`, { method: 'DELETE', accessToken });
+}
+
+export function editarEntradaBitacora(
+  accessToken: string,
+  acuarioId: string,
+  entradaId: string,
+  datos: {
+    tipoEventoId: number;
+    observacion: string;
+    fechaEvento: string;
+    fotosAEliminar: string[];
+    fotosNuevas: FotoNueva[];
+  }
+): Promise<EntradaBitacora> {
+  const formData = new FormData();
+  formData.append('tipoEventoId', String(datos.tipoEventoId));
+  formData.append('observacion', datos.observacion);
+  formData.append('fechaEvento', datos.fechaEvento);
+  formData.append('fotosAEliminar', datos.fotosAEliminar.join(','));
+  for (const foto of datos.fotosNuevas) {
+    formData.append(
+      'fotos',
+      { uri: foto.uri, name: foto.nombre, type: foto.tipo } as unknown as Blob
+    );
+  }
+
+  return pedir<EntradaBitacora>(`/acuarios/${acuarioId}/bitacora/${entradaId}`, {
+    method: 'PUT',
+    accessToken,
+    body: formData,
+  });
+}
+
+export interface Enchufe {
+  id: string;
+  numero_canal: number;
+  nombre: string;
+  estado_actual: boolean;
+}
+
+export function listarEnchufes(accessToken: string, acuarioId: string): Promise<Enchufe[]> {
+  return pedir<Enchufe[]>(`/acuarios/${acuarioId}/enchufes`, { accessToken });
+}
+
+export function cambiarEstadoEnchufe(
+  accessToken: string,
+  acuarioId: string,
+  canal: number,
+  encendido: boolean
+): Promise<{ canal: number; encendidoSolicitado: boolean }> {
+  return pedir<{ canal: number; encendidoSolicitado: boolean }>(`/acuarios/${acuarioId}/enchufes/${canal}`, {
+    method: 'PUT',
+    accessToken,
+    body: { encendido },
+  });
+}

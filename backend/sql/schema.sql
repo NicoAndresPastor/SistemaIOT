@@ -14,8 +14,6 @@ CREATE TYPE estado_recomendacion AS ENUM ('VIGENTE', 'ATENDIDA', 'DESCARTADA');
 
 CREATE TYPE tipo_hallazgo AS ENUM ('TENDENCIA_ASCENDENTE', 'TENDENCIA_DESCENDENTE', 'OSCILACION_ANORMAL');
 
-CREATE TYPE tipo_evento_bitacora AS ENUM ('ALIMENTACION', 'CAMBIO_AGUA', 'PODA_PLANTAS', 'MEDICACION', 'OTRO');
-
 
 CREATE TABLE usuario (
     id                     UUID PRIMARY KEY DEFAULT gen_random_uuid(),
@@ -112,7 +110,10 @@ CREATE TABLE accionamiento (
     usuario_id      UUID REFERENCES usuario(id) ON DELETE SET NULL,
     estado_inicial  BOOLEAN NOT NULL,
     estado_final    BOOLEAN NOT NULL,
-    fecha_hora      TIMESTAMPTZ NOT NULL DEFAULT now()
+    fecha_hora      TIMESTAMPTZ NOT NULL DEFAULT now(),
+    -- NULL mientras la placa no informe que aplico la orden; si queda NULL
+    -- para siempre, la orden fue reemplazada por otra antes de ejecutarse.
+    fecha_confirmacion TIMESTAMPTZ
 );
 
 CREATE INDEX idx_accionamiento_enchufe ON accionamiento(enchufe_id);
@@ -177,10 +178,15 @@ CREATE INDEX idx_entrega_notificacion_sesion ON entrega_notificacion(sesion_id);
 CREATE INDEX idx_entrega_notificacion_alerta ON entrega_notificacion(alerta_id);
 
 
+CREATE TABLE tipo_evento (
+    id              SMALLINT GENERATED ALWAYS AS IDENTITY PRIMARY KEY,
+    nombre          TEXT NOT NULL UNIQUE
+);
+
 CREATE TABLE entrada_bitacora (
     id              UUID PRIMARY KEY DEFAULT gen_random_uuid(),
     acuario_id      UUID NOT NULL REFERENCES acuario(id) ON DELETE CASCADE,
-    tipo_evento     tipo_evento_bitacora NOT NULL,
+    tipo_evento_id  SMALLINT NOT NULL REFERENCES tipo_evento(id),
     observacion     TEXT,
     fecha_evento    TIMESTAMPTZ NOT NULL,
     fecha_registro  TIMESTAMPTZ NOT NULL DEFAULT now()
@@ -225,3 +231,10 @@ INSERT INTO parametro (codigo, nombre, unidad, tiene_sensor, min_fisico, max_fis
     ('NITRITOS',  'Nitritos',      'mg/L',   false, 0,   5,    0,   0.25),
     ('NITRATOS',  'Nitratos',      'mg/L',   false, 0,   200,  0,   40),
     ('DUREZA',    'Dureza',        '°dGH',   false, 0,   30,   4,   12);
+
+INSERT INTO tipo_evento (nombre) VALUES
+    ('Alimentación'),
+    ('Cambio de agua'),
+    ('Poda de plantas'),
+    ('Medicación'),
+    ('Otro');

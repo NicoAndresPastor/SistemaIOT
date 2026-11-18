@@ -2,8 +2,7 @@
 #include <WebServer.h>
 #include <DNSServer.h>
 #include <Preferences.h>
-#define MQTT_MAX_PACKET_SIZE 384
-#include <PubSubClient.h>
+#include <mqtt_client.h>
 #include <ArduinoJson.h>
 #include <OneWire.h>
 #include <DallasTemperature.h>
@@ -46,6 +45,9 @@ const bool SIMULAR_SENSORES = false;
 const unsigned long TIMEOUT_NTP_MS = 15000;
 const unsigned long INTERVALO_REINTENTO_MQTT_INICIAL_MS = 1000;
 const unsigned long INTERVALO_REINTENTO_MQTT_MAX_MS = 5UL * 60 * 1000;
+const int ESPERA_RECONEXION_AUTOMATICA_MS = 24 * 60 * 60 * 1000;
+const int MQTT_KEEPALIVE_S = 15;
+const int MQTT_TAMANO_BUFFER = 1024;
 
 const uint32_t CAPACIDAD_REGISTROS_PENDIENTES = 10000;
 const char* ARCHIVO_PENDIENTES = "/pendientes.dat";
@@ -62,8 +64,20 @@ Preferences memoriaBuffer;
 Preferences memoriaEnchufes;
 WebServer servidorConfig(80);
 DNSServer dnsServer;
-WiFiClient wifiClient;
-PubSubClient mqttClient(wifiClient);
+esp_mqtt_client_handle_t clienteMqtt = nullptr;
+bool mqttIniciado = false;
+volatile bool mqttConectado = false;
+volatile uint32_t conexionesMqtt = 0;
+uint32_t conexionesMqttAtendidas = 0;
+bool mqttConectadoAntes = false;
+String idClienteMqtt;
+
+struct MensajeMqtt {
+  char topic[96];
+  char payload[320];
+  uint16_t largo;
+};
+QueueHandle_t colaMensajesMqtt = nullptr;
 U8G2_SSD1306_128X64_NONAME_F_HW_I2C display(U8G2_R0, U8X8_PIN_NONE);
 bool hayDisplay = false;
 RTC_DS3231 rtc;
@@ -162,12 +176,10 @@ void loop() {
     return;
   }
 
-  if (!mqttClient.connected()) {
-    intentarConectarMqtt();
-  }
-  mqttClient.loop();
+  atenderConexionMqtt();
+  atenderMensajesMqtt();
 
-  if (mqttClient.connected() && bufferCantidad > 0) {
+  if (mqttConectado && bufferCantidad > 0) {
     reenviarPendientes(5);
   }
 
@@ -385,8 +397,7 @@ void conectarWifiGuardado() {
   Serial.println(WiFi.localIP());
 
   sincronizarHora();
-  mqttClient.setServer(MQTT_BROKER, MQTT_PORT);
-  mqttClient.setCallback(manejarMensajeMqtt);
+  iniciarClienteMqtt();
 }
 
 void sincronizarHora() {
@@ -415,29 +426,108 @@ void sincronizarHora() {
   if (hayRtc) rtc.adjust(DateTime((uint32_t)ahora));
 }
 
+void manejarEventoMqtt(void *args, esp_event_base_t base, int32_t idEvento, void *datosEvento) {
+  esp_mqtt_event_handle_t evento = (esp_mqtt_event_handle_t)datosEvento;
+  switch ((esp_mqtt_event_id_t)idEvento) {
+    case MQTT_EVENT_CONNECTED:
+      mqttConectado = true;
+      conexionesMqtt = conexionesMqtt + 1;
+      break;
+    case MQTT_EVENT_DISCONNECTED:
+      mqttConectado = false;
+      break;
+    case MQTT_EVENT_DATA: {
+      static MensajeMqtt mensaje;
+      if (evento->current_data_offset != 0) break;
+      if (evento->total_data_len >= (int)sizeof(mensaje.payload)) break;
+      if (evento->topic_len >= (int)sizeof(mensaje.topic)) break;
+      memcpy(mensaje.topic, evento->topic, evento->topic_len);
+      mensaje.topic[evento->topic_len] = '\0';
+      memcpy(mensaje.payload, evento->data, evento->data_len);
+      mensaje.payload[evento->data_len] = '\0';
+      mensaje.largo = evento->data_len;
+      xQueueSend(colaMensajesMqtt, &mensaje, 0);
+      break;
+    }
+    default:
+      break;
+  }
+}
+
+void iniciarClienteMqtt() {
+  colaMensajesMqtt = xQueueCreate(8, sizeof(MensajeMqtt));
+  idClienteMqtt = "ESP32-" + String(IDENTIFICADOR_HARDWARE);
+
+  esp_mqtt_client_config_t config = {};
+  config.broker.address.hostname = MQTT_BROKER;
+  config.broker.address.port = MQTT_PORT;
+  config.broker.address.transport = MQTT_TRANSPORT_OVER_TCP;
+  config.credentials.client_id = idClienteMqtt.c_str();
+  config.session.keepalive = MQTT_KEEPALIVE_S;
+  config.network.reconnect_timeout_ms = ESPERA_RECONEXION_AUTOMATICA_MS;
+  config.buffer.size = MQTT_TAMANO_BUFFER;
+
+  clienteMqtt = esp_mqtt_client_init(&config);
+  esp_mqtt_client_register_event(clienteMqtt, MQTT_EVENT_ANY, manejarEventoMqtt, nullptr);
+}
+
+void atenderConexionMqtt() {
+  bool conectado = mqttConectado;
+  uint32_t conexiones = conexionesMqtt;
+  if (conexiones != conexionesMqttAtendidas) {
+    conexionesMqttAtendidas = conexiones;
+    alConectarMqtt();
+  } else if (!conectado && mqttConectadoAntes) {
+    Serial.println("Se perdio la conexion MQTT");
+    ultimoIntentoMqtt = millis();
+  }
+  mqttConectadoAntes = conectado;
+
+  if (!conectado) intentarConectarMqtt();
+}
+
 void intentarConectarMqtt() {
   if (millis() - ultimoIntentoMqtt < intervaloReintentoMqtt) return;
   ultimoIntentoMqtt = millis();
 
-  Serial.print("Conectando a MQTT...");
-  String clientId = "ESP32-" + String(IDENTIFICADOR_HARDWARE);
-  if (mqttClient.connect(clientId.c_str())) {
-    Serial.println(" conectado");
-    String topicComando = "acuarios/" + String(IDENTIFICADOR_HARDWARE) + "/calibracion/comando";
-    mqttClient.subscribe(topicComando.c_str());
-    String topicEnchufes = "acuarios/" + String(IDENTIFICADOR_HARDWARE) + "/enchufes/comando";
-    mqttClient.subscribe(topicEnchufes.c_str());
-    publicarEstadoEnchufes();
-    intervaloReintentoMqtt = INTERVALO_REINTENTO_MQTT_INICIAL_MS;
-    if (bufferCantidad > 0) {
-      Serial.printf("Conexion restablecida: enviando %u lecturas pendientes\n", bufferCantidad);
-    }
+  if (mqttIniciado) {
+    Serial.print("Reintentando conexion MQTT");
+    esp_mqtt_client_reconnect(clienteMqtt);
   } else {
-    Serial.print(" fallo, codigo=");
-    Serial.print(mqttClient.state());
-    intervaloReintentoMqtt = min(intervaloReintentoMqtt * 2, INTERVALO_REINTENTO_MQTT_MAX_MS);
-    Serial.printf(" -- reintentando en %lus\n", intervaloReintentoMqtt / 1000);
+    Serial.print("Conectando a MQTT");
+    esp_mqtt_client_start(clienteMqtt);
+    mqttIniciado = true;
   }
+  intervaloReintentoMqtt = min(intervaloReintentoMqtt * 2, INTERVALO_REINTENTO_MQTT_MAX_MS);
+  Serial.printf(" -- si falla, proximo intento en %lus\n", intervaloReintentoMqtt / 1000);
+}
+
+void alConectarMqtt() {
+  Serial.println("MQTT conectado");
+  intervaloReintentoMqtt = INTERVALO_REINTENTO_MQTT_INICIAL_MS;
+
+  String base = "acuarios/" + String(IDENTIFICADOR_HARDWARE);
+  esp_mqtt_client_subscribe_single(clienteMqtt, (base + "/calibracion/comando").c_str(), 0);
+  for (int canal = 1; canal <= CANTIDAD_ENCHUFES; canal++) {
+    publicarEnchufeReportado(canal);
+  }
+  esp_mqtt_client_subscribe_single(clienteMqtt, (base + "/enchufes/+/deseado").c_str(), 1);
+
+  if (bufferCantidad > 0) {
+    Serial.printf("Conexion restablecida: enviando %u lecturas pendientes\n", bufferCantidad);
+  }
+}
+
+void atenderMensajesMqtt() {
+  static MensajeMqtt mensaje;
+  while (colaMensajesMqtt && xQueueReceive(colaMensajesMqtt, &mensaje, 0) == pdTRUE) {
+    manejarMensajeMqtt(mensaje.topic, (byte *)mensaje.payload, mensaje.largo);
+  }
+}
+
+bool publicarMqtt(const String &topic, const char *payload, int qos, bool retener) {
+  if (!mqttConectado) return false;
+  return esp_mqtt_client_publish(clienteMqtt, topic.c_str(), payload, 0, qos, retener ? 1 : 0) >= 0;
 }
 
 float leerMv(int pin, int n, uint32_t &mn, uint32_t &mx) {
@@ -592,7 +682,7 @@ void guardarLecturaPendiente(const String &parametro, float valor, uint32_t marc
 void reenviarPendientes(uint32_t maxGrupos) {
   uint32_t gruposEnviados = 0;
 
-  while (bufferCantidad > 0 && mqttClient.connected() && gruposEnviados < maxGrupos) {
+  while (bufferCantidad > 0 && mqttConectado && gruposEnviados < maxGrupos) {
     RegistroPendiente primero;
     if (!leerRegistroPendiente(bufferCabeza, primero)) {
       Serial.println("Buffer offline: no se pudo leer un registro pendiente");
@@ -626,7 +716,7 @@ void reenviarPendientes(uint32_t maxGrupos) {
     char buffer[256];
     serializeJson(doc, buffer);
     String topic = "acuarios/" + String(IDENTIFICADOR_HARDWARE) + "/mediciones";
-    if (!mqttClient.publish(topic.c_str(), buffer)) {
+    if (!publicarMqtt(topic, buffer, 0, false)) {
       Serial.println("Buffer offline: fallo el reenvio, se reintenta en la proxima vuelta");
       return;
     }
@@ -635,7 +725,6 @@ void reenviarPendientes(uint32_t maxGrupos) {
     bufferCantidad -= agrupados;
     guardarMetaBuffer();
     gruposEnviados++;
-    mqttClient.loop();
   }
 
   if (bufferCantidad == 0 && gruposEnviados > 0) {
@@ -764,7 +853,7 @@ void publicarOGuardarLecturas() {
 
   time_t ahora = time(nullptr);
 
-  if (mqttClient.connected()) {
+  if (mqttConectado) {
     publicarLecturas(ahora);
     return;
   }
@@ -802,7 +891,7 @@ void publicarLecturas(time_t marcaTemporalEpoch) {
   serializeJson(doc, buffer);
 
   String topic = "acuarios/" + String(IDENTIFICADOR_HARDWARE) + "/mediciones";
-  mqttClient.publish(topic.c_str(), buffer);
+  publicarMqtt(topic, buffer, 0, false);
 
   Serial.print("Publicado en ");
   Serial.print(topic);
@@ -887,7 +976,7 @@ void publicarRespuestaCalibracion(JsonDocument &resp) {
   char buffer[320];
   serializeJson(resp, buffer);
   String topic = "acuarios/" + String(IDENTIFICADOR_HARDWARE) + "/calibracion/respuesta";
-  mqttClient.publish(topic.c_str(), buffer);
+  publicarMqtt(topic, buffer, 0, false);
   Serial.print("Calibracion, respuesta publicada: ");
   Serial.println(buffer);
 }
@@ -948,8 +1037,8 @@ void manejarMensajeMqtt(char *topic, byte *payload, unsigned int length) {
   String t = String(topic);
   if (t.endsWith("/calibracion/comando")) {
     manejarComandoCalibracion(payload, length);
-  } else if (t.endsWith("/enchufes/comando")) {
-    manejarComandoEnchufes(payload, length);
+  } else if (t.endsWith("/deseado")) {
+    manejarEnchufeDeseado(t, payload, length);
   }
 }
 
@@ -972,43 +1061,39 @@ void iniciarEnchufes() {
   }
 }
 
-void publicarEstadoEnchufes() {
-  if (!mqttClient.connected()) return;
-  JsonDocument doc;
-  JsonArray lista = doc["enchufes"].to<JsonArray>();
-  for (int i = 0; i < CANTIDAD_ENCHUFES; i++) {
-    JsonObject e = lista.add<JsonObject>();
-    e["canal"] = i + 1;
-    e["encendido"] = enchufeEncendido[i];
-  }
-  char buffer[160];
-  size_t n = serializeJson(doc, buffer, sizeof(buffer));
-  String topic = "acuarios/" + String(IDENTIFICADOR_HARDWARE) + "/enchufes/estado";
-  mqttClient.publish(topic.c_str(), (const uint8_t *)buffer, n, true);
+void publicarEnchufeReportado(int canal) {
+  char buffer[24];
+  snprintf(buffer, sizeof buffer, "{\"estado\":%s}", enchufeEncendido[canal - 1] ? "true" : "false");
+  String topic = "acuarios/" + String(IDENTIFICADOR_HARDWARE) + "/enchufes/" + String(canal) + "/reportado";
+  publicarMqtt(topic, buffer, 1, true);
 }
 
 bool cambiarEnchufe(int canal, bool encendido) {
   if (canal < 1 || canal > CANTIDAD_ENCHUFES) return false;
-  aplicarEnchufe(canal - 1, encendido);
-  String clave = "c" + String(canal);
-  memoriaEnchufes.putBool(clave.c_str(), encendido);
-  Serial.printf("Enchufe %d %s\n", canal, encendido ? "ENCENDIDO" : "APAGADO");
-  publicarEstadoEnchufes();
+  if (enchufeEncendido[canal - 1] != encendido) {
+    aplicarEnchufe(canal - 1, encendido);
+    String clave = "c" + String(canal);
+    memoriaEnchufes.putBool(clave.c_str(), encendido);
+    Serial.printf("Enchufe %d %s\n", canal, encendido ? "ENCENDIDO" : "APAGADO");
+  }
+  publicarEnchufeReportado(canal);
   return true;
 }
 
-// Payload: {"canal":1,"encendido":true}
-void manejarComandoEnchufes(byte *payload, unsigned int length) {
+void manejarEnchufeDeseado(const String &topic, byte *payload, unsigned int length) {
+  if (length == 0) return;
+  const String marcador = "/enchufes/";
+  int inicio = topic.indexOf(marcador);
+  int fin = topic.lastIndexOf("/deseado");
+  if (inicio < 0 || fin <= inicio) return;
+  int canal = topic.substring(inicio + marcador.length(), fin).toInt();
+
   JsonDocument doc;
-  if (deserializeJson(doc, payload, length)) {
-    Serial.println("Comando de enchufe con JSON invalido");
+  if (deserializeJson(doc, payload, length) || !doc["estado"].is<bool>()) {
+    Serial.println("Orden de enchufe invalida: falta el estado");
     return;
   }
-  if (!doc["canal"].is<int>() || !doc["encendido"].is<bool>()) {
-    Serial.println("Comando de enchufe incompleto: falta canal o encendido");
-    return;
-  }
-  if (!cambiarEnchufe(doc["canal"].as<int>(), doc["encendido"].as<bool>())) {
+  if (!cambiarEnchufe(canal, doc["estado"].as<bool>())) {
     Serial.println("Canal de enchufe invalido");
   }
 }
@@ -1160,7 +1245,7 @@ void mostrarMensajeEnDisplay(const char* titulo, const char* linea1, const char*
 
 const char* estadoConexion() {
   if (WiFi.status() != WL_CONNECTED) return "Sin WiFi";
-  if (!mqttClient.connected()) return "WiFi OK - sin MQTT";
+  if (!mqttConectado) return "WiFi OK - sin MQTT";
   return "Conectado";
 }
 

@@ -5,6 +5,7 @@ import { EditarNombreAcuarioScreen } from '../acuarios/EditarNombreAcuarioScreen
 import { VincularDispositivoScreen } from '../acuarios/VincularDispositivoScreen';
 import { DesvincularDispositivoScreen } from '../acuarios/DesvincularDispositivoScreen';
 import { CalibrarSensorScreen } from '../acuarios/CalibrarSensorScreen';
+import { CrearEntradaBitacoraScreen } from '../acuarios/CrearEntradaBitacoraScreen';
 import { MiCuentaScreen } from '../auth/MiCuentaScreen';
 import { colores } from '../ui/colores';
 import { AcuarioTabsNavigator } from './AcuarioTabsNavigator';
@@ -44,6 +45,11 @@ export function ApplicationNavigator() {
         name="CalibrarSensor"
         component={CalibrarSensorScreen}
         options={{ headerShown: false }}
+      />
+      <Stack.Screen
+        name="CrearEntradaBitacora"
+        component={CrearEntradaBitacoraScreen}
+        options={{ headerShown: false, presentation: 'transparentModal', animation: 'slide_from_bottom' }}
       />
       <Stack.Screen name="MiCuenta" component={MiCuentaScreen} options={{ headerShown: false }} />
     </Stack.Navigator>

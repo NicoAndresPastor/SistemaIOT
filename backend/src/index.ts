@@ -2,8 +2,10 @@ import express, { Request, Response, NextFunction } from 'express';
 import { authRouter } from './auth/routes';
 import { requireAuth } from './auth/middleware';
 import { acuariosRouter } from './acuarios/routes';
+import { tiposEventoRouter } from './bitacora/routes';
 import { iniciarSuscriptorMqtt } from './mqtt/subscriber';
 import { inicializarClienteCalibracion } from './mqtt/calibracion';
+import { inicializarClienteEnchufes } from './mqtt/enchufes';
 
 const app = express();
 const PORT = 3000;
@@ -16,6 +18,7 @@ app.get('/', (req, res) => {
 
 app.use('/auth', authRouter);
 app.use('/acuarios', requireAuth, acuariosRouter);
+app.use('/tipos-evento', requireAuth, tiposEventoRouter);
 
 app.use((err: any, req: Request, res: Response, next: NextFunction) => {
   console.error(err);
@@ -32,3 +35,4 @@ app.listen(PORT, () => {
 
 const clienteMqtt = iniciarSuscriptorMqtt();
 inicializarClienteCalibracion(clienteMqtt);
+inicializarClienteEnchufes(clienteMqtt);
